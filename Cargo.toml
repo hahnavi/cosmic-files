@@ -76,7 +76,7 @@ features = ["fs", "io", "macros", "polling", "runtime"]
 
 [dependencies.libcosmic]
 git = "https://github.com/hahnavi/libcosmic.git"
-rev = "af396d7b07e764bdf4fee7936533a12929c3d8e1"
+rev = "ba613c3b355ce858bfac9cc43812c019562539a0"
 default-features = false
 #TODO: a11y feature crashes
 features = [
@@ -157,7 +157,6 @@ tokio = { version = "1", features = ["rt", "macros"] }
 # libcosmic = { git = "https://github.com/pop-os/libcosmic//", branch = "theme-v2" }
 # cosmic-config = { git = "https://github.com/pop-os/libcosmic//", branch = "theme-v2" }
 # cosmic-theme = { git = "https://github.com/pop-os/libcosmic//", branch = "theme-v2" }
-
 
 # [patch.'https://github.com/pop-os/smithay-clipboard']
 # smithay-clipboard = { path = "../smithay-clipboard" }
