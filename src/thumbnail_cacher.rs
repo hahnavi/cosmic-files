@@ -1,9 +1,8 @@
 use image::DynamicImage;
 use md5::{Digest, Md5};
-use rustc_hash::FxHashMap;
 use std::error::Error;
 use std::fs::{self, File};
-use std::io::{self, BufReader, BufWriter};
+use std::io::{self, BufReader, BufWriter, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -32,17 +31,12 @@ impl ThumbnailCacher {
             .ok_or("failed to get thumbnail cache directory".to_string())?;
         let thumbnail_filename = thumbnail_cache_filename(&file_uri);
         let thumbnail_dir = cache_base_dir.join(thumbnail_size.subdirectory_name());
-        if !thumbnail_dir.is_dir() {
-            log::warn!(
-                "{} is not a directory, creating one now",
+        Self::ensure_private_directory(&thumbnail_dir).map_err(|err| {
+            format!(
+                "failed to prepare thumbnail cache directory {}: {err}",
                 thumbnail_dir.display()
-            );
-            let _: () = log::error!(
-                "{} failed to create directory, this error can be expected on first run",
-                thumbnail_dir.display()
-            );
-            fs::create_dir_all(&thumbnail_dir).unwrap_or(());
-        }
+            )
+        })?;
         let thumbnail_path = thumbnail_dir.join(&thumbnail_filename);
         let thumbnail_fail_marker_path = cache_base_dir
             .join("fail")
@@ -92,110 +86,147 @@ impl ThumbnailCacher {
     }
 
     pub fn update_with_temp_file(&self, temp_file: NamedTempFile) -> Result<&Path, Box<dyn Error>> {
-        #[cfg(unix)]
-        fs::set_permissions(temp_file.path(), fs::Permissions::from_mode(0o600))?;
-        self.update_thumbnail_text_metadata(temp_file.path())?;
-        fs::rename(temp_file.path(), &self.thumbnail_path)?;
+        let file = File::open(temp_file.path())?;
+        let mut decoder = png::Decoder::new_with_limits(
+            BufReader::new(file),
+            png::Limits {
+                bytes: self.maximum_decoded_bytes(),
+            },
+        );
+        // Replace untrusted text with source-derived cache metadata.
+        decoder.set_ignore_text_chunk(true);
+        let mut reader = decoder.read_info()?;
+        let (width, height, color_type, bit_depth) = {
+            let info = reader.info();
+            (info.width, info.height, info.color_type, info.bit_depth)
+        };
+        let maximum_size = self.thumbnail_size.pixel_size();
+        if width > maximum_size || height > maximum_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "thumbnail output {width}x{height} exceeds cache size {maximum_size}x{maximum_size}"
+                ),
+            )
+            .into());
+        }
 
+        let mut image_data = vec![
+            0;
+            reader
+                .output_buffer_size()
+                .ok_or("the required thumbnail buffer is too large")?
+        ];
+        let output = reader.next_frame(&mut image_data)?;
+        image_data.truncate(output.buffer_size());
+
+        let mut cache_temp = self.cache_temp_file(&self.thumbnail_dir)?;
+        {
+            let mut output = BufWriter::new(cache_temp.as_file_mut());
+            let mut encoder = png::Encoder::new(&mut output, width, height);
+            encoder.set_color(color_type);
+            encoder.set_depth(bit_depth);
+            self.add_thumbnail_text_metadata(&mut encoder)?;
+            encoder.write_header()?.write_image_data(&image_data)?;
+            output.flush()?;
+        }
+
+        self.publish(cache_temp, &self.thumbnail_path)?;
         Ok(&self.thumbnail_path)
     }
 
     pub fn update_with_image(&self, image: DynamicImage) -> Result<&Path, Box<dyn Error>> {
-        let temp_file = tempfile::Builder::new()
-            .prefix("cosmic-files-")
-            .tempfile_in(&self.thumbnail_dir)?;
+        let mut temp_file = self.cache_temp_file(&self.thumbnail_dir)?;
         {
-            let file = File::create(temp_file.path())?;
             let image = image
                 .thumbnail(
                     self.thumbnail_size.pixel_size(),
                     self.thumbnail_size.pixel_size(),
                 )
                 .into_rgba8();
-            let writer = BufWriter::new(file);
-            let mut encoder = png::Encoder::new(writer, image.width(), image.height());
+            let mut output = BufWriter::new(temp_file.as_file_mut());
+            let mut encoder = png::Encoder::new(&mut output, image.width(), image.height());
             encoder.set_color(png::ColorType::Rgba);
             encoder.set_depth(png::BitDepth::Eight);
-            encoder
-                .write_header()?
-                .write_image_data(&image.into_raw())?;
+            self.add_thumbnail_text_metadata(&mut encoder)?;
+            encoder.write_header()?.write_image_data(image.as_raw())?;
+            output.flush()?;
         }
 
-        self.update_with_temp_file(temp_file)
+        self.publish(temp_file, &self.thumbnail_path)?;
+        Ok(&self.thumbnail_path)
     }
 
     pub fn create_fail_marker(&self) -> Result<(), Box<dyn Error>> {
-        if let Some(dir) = self.thumbnail_fail_marker_path.parent() {
-            fs::create_dir_all(dir)?;
-            #[cfg(unix)]
-            fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+        let fail_dir = self
+            .thumbnail_fail_marker_path
+            .parent()
+            .ok_or("thumbnail fail marker has no parent directory")?;
+        Self::ensure_private_directory(fail_dir)?;
+        let mut temp_file = self.cache_temp_file(fail_dir)?;
+        {
+            let mut output = BufWriter::new(temp_file.as_file_mut());
+            let mut encoder = png::Encoder::new(&mut output, 1, 1);
+            encoder.set_color(png::ColorType::Grayscale);
+            encoder.set_depth(png::BitDepth::One);
+            self.add_thumbnail_text_metadata(&mut encoder)?;
+            encoder.write_header()?.write_image_data(&[0])?;
+            output.flush()?;
         }
-
-        let file = File::create(&self.thumbnail_fail_marker_path)?;
-        let writer = BufWriter::new(file);
-        let mut encoder = png::Encoder::new(writer, 1, 1);
-        encoder.set_color(png::ColorType::Grayscale);
-        encoder.set_depth(png::BitDepth::One);
-        encoder.write_header()?.write_image_data(&[0])?;
-        self.update_thumbnail_text_metadata(&self.thumbnail_fail_marker_path)
+        self.publish(temp_file, &self.thumbnail_fail_marker_path)?;
+        Ok(())
     }
 
-    fn update_thumbnail_text_metadata(&self, path: &Path) -> Result<(), Box<dyn Error>> {
-        let file = File::open(path)?;
-        let reader = BufReader::new(file);
-
-        let decoder = png::Decoder::new(reader);
-        let mut reader = decoder.read_info()?;
-        let (width, height, color_type, bit_depth, mut text_chunks) = {
-            let info = reader.info();
-            let text_chunks: FxHashMap<String, String> = info
-                .uncompressed_latin1_text
-                .iter()
-                .map(|chunk| (chunk.keyword.clone(), chunk.text.clone()))
-                .collect();
-            (
-                info.width,
-                info.height,
-                info.color_type,
-                info.bit_depth,
-                text_chunks,
-            )
-        };
-
-        let mut image_data = vec![
-            0;
-            reader
-                .output_buffer_size()
-                .ok_or("The required image buffer size is too large.")?
-        ];
-        reader.next_frame(&mut image_data)?;
-
-        let file = File::create(path)?;
-        let writer = BufWriter::new(file);
-
-        let mut encoder = png::Encoder::new(writer, width, height);
-        encoder.set_color(color_type);
-        encoder.set_depth(bit_depth);
-
-        text_chunks.insert("Software".to_string(), "COSMIC Files".to_string());
-        text_chunks.insert("Thumb::URI".to_string(), self.file_uri.clone());
+    fn add_thumbnail_text_metadata<W: Write>(
+        &self,
+        encoder: &mut png::Encoder<'_, W>,
+    ) -> Result<(), Box<dyn Error>> {
         let metadata = std::fs::metadata(&self.file_path)?;
-        let size = metadata.len();
-        text_chunks.insert("Thumb::Size".to_string(), size.to_string());
         let mtime = metadata
             .modified()?
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        text_chunks.insert("Thumb::MTime".to_string(), mtime.to_string());
 
-        for (keyword, text) in text_chunks {
-            encoder.add_text_chunk(keyword, text)?;
+        for (keyword, text) in [
+            ("Software", "COSMIC Files".to_string()),
+            ("Thumb::URI", self.file_uri.clone()),
+            ("Thumb::Size", metadata.len().to_string()),
+            ("Thumb::MTime", mtime.to_string()),
+        ] {
+            encoder.add_text_chunk(keyword.to_string(), text)?;
         }
+        Ok(())
+    }
 
-        let mut writer = encoder.write_header()?;
-        writer.write_image_data(&image_data)?;
+    fn maximum_decoded_bytes(&self) -> usize {
+        let edge = self.thumbnail_size.pixel_size() as usize;
+        // Allow the bucket's largest 16-bit RGBA frame.
+        edge.saturating_mul(edge).saturating_mul(8)
+    }
 
+    fn cache_temp_file(&self, directory: &Path) -> io::Result<NamedTempFile> {
+        tempfile::Builder::new()
+            .prefix(".cosmic-files-")
+            .tempfile_in(directory)
+    }
+
+    fn publish(&self, temp_file: NamedTempFile, destination: &Path) -> Result<(), Box<dyn Error>> {
+        #[cfg(unix)]
+        fs::set_permissions(temp_file.path(), fs::Permissions::from_mode(0o600))?;
+        temp_file.persist(destination)?;
+        Ok(())
+    }
+
+    fn ensure_private_directory(directory: &Path) -> io::Result<()> {
+        fs::create_dir_all(directory)?;
+        #[cfg(unix)]
+        {
+            let permissions = fs::metadata(directory)?.permissions();
+            if permissions.mode() & 0o777 != 0o700 {
+                fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+            }
+        }
         Ok(())
     }
 
@@ -367,3 +398,93 @@ static THUMBNAIL_CACHE_BASE_DIR: LazyLock<Option<PathBuf>> = LazyLock::new(|| {
 
     None
 });
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::{DynamicImage, RgbaImage};
+    use tempfile::TempDir;
+
+    fn test_cacher(root: &TempDir, size: ThumbnailSize) -> ThumbnailCacher {
+        let source = root.path().join("source.pdf");
+        fs::write(&source, b"source data").unwrap();
+        let thumbnail_dir = root.path().join(size.subdirectory_name());
+        ThumbnailCacher::ensure_private_directory(&thumbnail_dir).unwrap();
+
+        ThumbnailCacher {
+            file_path: source,
+            file_uri: "file:///source.pdf".to_string(),
+            thumbnail_path: thumbnail_dir.join("thumbnail.png"),
+            thumbnail_dir,
+            thumbnail_size: size,
+            thumbnail_fail_marker_path: root.path().join("fail/thumbnail.png"),
+        }
+    }
+
+    fn external_png(root: &TempDir, width: u32, height: u32) -> NamedTempFile {
+        let mut file = tempfile::Builder::new()
+            .prefix("external-")
+            .tempfile_in(root.path())
+            .unwrap();
+        {
+            let mut encoder = png::Encoder::new(file.as_file_mut(), width, height);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder
+                .write_header()
+                .unwrap()
+                .write_image_data(&vec![0x7f; width as usize * height as usize * 4])
+                .unwrap();
+        }
+        file
+    }
+
+    #[test]
+    fn external_thumbnail_is_staged_with_freedesktop_metadata() {
+        let root = TempDir::new().unwrap();
+        let cacher = test_cacher(&root, ThumbnailSize::Normal);
+        let external = external_png(&root, 64, 32);
+
+        let cached_path = cacher.update_with_temp_file(external).unwrap();
+
+        assert_eq!(cached_path, cacher.thumbnail_path);
+        assert!(cacher.is_thumbnail_valid(cached_path));
+        let reader = png::Decoder::new(BufReader::new(File::open(cached_path).unwrap()))
+            .read_info()
+            .unwrap();
+        let texts = &reader.info().uncompressed_latin1_text;
+        assert!(
+            texts
+                .iter()
+                .any(|text| { text.keyword == "Software" && text.text == "COSMIC Files" })
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|text| { text.keyword == "Thumb::URI" && text.text == cacher.file_uri })
+        );
+    }
+
+    #[test]
+    fn oversized_external_thumbnail_is_rejected() {
+        let root = TempDir::new().unwrap();
+        let cacher = test_cacher(&root, ThumbnailSize::Normal);
+        let external = external_png(&root, 129, 1);
+
+        assert!(cacher.update_with_temp_file(external).is_err());
+        assert!(!cacher.thumbnail_path.exists());
+    }
+
+    #[test]
+    fn image_and_failure_updates_publish_valid_cache_entries() {
+        let root = TempDir::new().unwrap();
+        let cacher = test_cacher(&root, ThumbnailSize::Normal);
+        let image = DynamicImage::ImageRgba8(RgbaImage::new(16, 8));
+
+        let cached_path = cacher.update_with_image(image).unwrap();
+        assert!(cacher.is_thumbnail_valid(cached_path));
+
+        cacher.create_fail_marker().unwrap();
+        assert!(cacher.is_thumbnail_valid(&cacher.thumbnail_fail_marker_path));
+    }
+}

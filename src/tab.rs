@@ -23,7 +23,7 @@ use icu::datetime::input::DateTime;
 use icu::datetime::options::TimePrecision;
 use icu::datetime::{DateTimeFormatter, DateTimeFormatterPreferences, fieldsets};
 use icu::locale::preferences::extensions::unicode::keywords::HourCycle;
-use image::{DynamicImage, ImageReader};
+use image::ImageReader;
 use jiff_icu::ConvertFrom;
 use mime_guess::{Mime, mime};
 use rustc_hash::FxHashMap;
@@ -78,14 +78,18 @@ const MAX_SEARCH_RESULTS: usize = 200;
 const THUMBNAIL_SIZE: u32 = (ICON_SIZE_GRID as u32) * (ICON_SCALE_MAX as u32);
 /// Maximum bytes of text to pass to the editor for preview; caps shaping work to avoid blocking.
 /// Files larger than this get a truncated preview (first N bytes only).
-const TEXT_PREVIEW_MAX_BYTES: usize = 256 * 1024; // 256 KiB
+const TEXT_PREVIEW_MAX_BYTES: usize = 32 * 1024; // 32 KiB
 /// Maximum file size (bytes) to attempt text preview; files larger than this are skipped entirely.
 const TEXT_PREVIEW_MAX_FILE_BYTES: u64 = 8 * 1000 * 1000; // 8 MiB
+/// Number of extra viewport pages to retain thumbnails on each side.
+const THUMBNAIL_CACHE_MARGIN_PAGES: f32 = 1.0;
 
 // Thumbnail generation semaphore - limits parallel thumbnail workers
 // Uses 4 workers for balanced throughput and memory usage
 pub static THUMB_SEMAPHORE: LazyLock<tokio::sync::Semaphore> =
     LazyLock::new(|| tokio::sync::Semaphore::const_new(num_cpus::get().min(4)));
+/// Serialize memory-intensive PDF rendering.
+static PDF_THUMB_SEMAPHORE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 
 pub(crate) static SORT_OPTION_FALLBACK: LazyLock<FxHashMap<String, (HeadingOptions, bool)>> =
     LazyLock::new(|| {
@@ -867,7 +871,6 @@ pub fn item_from_entry(
     }
 
     let display_name = display_name_for_file(&path, &name, is_gvfs, is_desktop);
-
     Item {
         name,
         display_name,
@@ -1985,6 +1988,35 @@ impl Clone for ItemThumbnail {
 }
 
 impl ItemThumbnail {
+    fn icon_handle(&self) -> Option<widget::icon::Handle> {
+        match self {
+            Self::Image(handle, _) => Some(widget::icon::Handle {
+                symbolic: false,
+                data: widget::icon::Data::Image(handle.clone()),
+            }),
+            Self::Svg(handle) => Some(widget::icon::Handle {
+                symbolic: false,
+                data: widget::icon::Data::Svg(handle.clone()),
+            }),
+            Self::NotImage | Self::Text(_) => None,
+        }
+    }
+
+    fn retains_content(&self) -> bool {
+        !matches!(self, Self::NotImage)
+    }
+
+    fn is_pdf_mime(mime: &Mime) -> bool {
+        matches!(
+            mime.essence_str(),
+            "application/pdf"
+                | "application/x-bzpdf"
+                | "application/x-ext-pdf"
+                | "application/x-gzpdf"
+                | "application/x-xzpdf"
+        )
+    }
+
     pub fn new(
         path: &Path,
         metadata: ItemMetadata,
@@ -2142,23 +2174,41 @@ impl ItemThumbnail {
             }
         }
 
-        // Try external thumbnailers.
+        // External renderers must obey the configured input-size limit.
+        let external_thumbnailers = thumbnailer(&mime);
+        if !external_thumbnailers.is_empty() && !check_size("external", max_size_mb * 1000 * 1000) {
+            return Self::NotImage;
+        }
         let thumbnail_dir = thumbnail_cacher
             .as_ref()
             .ok()
             .map(ThumbnailCacher::thumbnail_dir);
-        if let Some((item_thumbnail, temp_file)) =
-            Self::generate_thumbnail_external(path, &mime, thumbnail_size, thumbnail_dir)
-        {
-            if let Ok(cache) = thumbnail_cacher
-                && let Err(err) = cache.update_with_temp_file(temp_file)
-            {
-                log::warn!("failed to update cache for {}: {}", path.display(), err);
+        if let Some(temp_file) = Self::generate_thumbnail_external(
+            path,
+            &external_thumbnailers,
+            thumbnail_size,
+            thumbnail_dir,
+        ) {
+            if let Ok(cache) = thumbnail_cacher {
+                match cache.update_with_temp_file(temp_file) {
+                    Ok(thumbnail_path) => {
+                        // Keep a cache path instead of a decoded image buffer.
+                        return Self::Image(widget::image::Handle::from_path(thumbnail_path), None);
+                    }
+                    Err(err) => {
+                        log::warn!("failed to update cache for {}: {}", path.display(), err);
+                    }
+                }
+            } else {
+                // Fall back to a memory-backed handle when caching is unavailable.
+                return Self::decode_external_thumbnail(temp_file.path(), thumbnail_size)
+                    .unwrap_or(Self::NotImage);
             }
-            return item_thumbnail;
+
+            return Self::NotImage;
         }
 
-        tried_supported_file = tried_supported_file || !thumbnailer(&mime).is_empty();
+        tried_supported_file = tried_supported_file || !external_thumbnailers.is_empty();
 
         // Try internal thumbnailers that don't get cached.
         //TODO: adjust limits for internal thumbnailers as desired
@@ -2229,12 +2279,12 @@ impl ItemThumbnail {
 
     fn generate_thumbnail_external(
         path: &Path,
-        mime: &mime::Mime,
+        thumbnailers: &[crate::thumbnailer::Thumbnailer],
         thumbnail_size: u32,
         thumbnail_dir: Option<&Path>,
-    ) -> Option<(Self, NamedTempFile)> {
+    ) -> Option<NamedTempFile> {
         // Try external thumbnailers
-        for thumbnailer in thumbnailer(mime) {
+        for thumbnailer in thumbnailers {
             let is_evince = thumbnailer.exec.starts_with("evince-thumbnailer ");
             let prefix = if is_evince {
                 //TODO: apparmor config for evince-thumbnailer does not allow /tmp/cosmic-files*
@@ -2273,22 +2323,22 @@ impl ItemThumbnail {
                         match image::ImageReader::open(file.path())
                             .and_then(ImageReader::with_guessed_format)
                         {
-                            Ok(reader) => match reader.decode().map(DynamicImage::into_rgba8) {
-                                Ok(image) => {
-                                    return Some((
-                                        Self::Image(
-                                            widget::image::Handle::from_rgba(
-                                                image.width(),
-                                                image.height(),
-                                                image.into_raw(),
-                                            ),
-                                            None,
-                                        ),
-                                        file,
-                                    ));
+                            Ok(reader) => match reader.into_dimensions() {
+                                Ok((width, height))
+                                    if width <= thumbnail_size && height <= thumbnail_size =>
+                                {
+                                    return Some(file);
                                 }
+                                Ok((width, height)) => log::warn!(
+                                    "thumbnailer produced oversized output for {}: {}x{} exceeds {}x{}",
+                                    path.display(),
+                                    width,
+                                    height,
+                                    thumbnail_size,
+                                    thumbnail_size
+                                ),
                                 Err(err) => {
-                                    log::warn!("failed to decode {}: {}", path.display(), err);
+                                    log::warn!("failed to inspect {}: {}", path.display(), err);
                                 }
                             },
                             Err(err) => {
@@ -2315,6 +2365,27 @@ impl ItemThumbnail {
         }
 
         None
+    }
+
+    fn decode_external_thumbnail(path: &Path, thumbnail_size: u32) -> Option<Self> {
+        let mut reader = image::ImageReader::open(path)
+            .and_then(ImageReader::with_guessed_format)
+            .ok()?;
+        let mut limits = image::Limits::default();
+        limits.max_image_width = Some(thumbnail_size);
+        limits.max_image_height = Some(thumbnail_size);
+        limits.max_alloc = Some(
+            u64::from(thumbnail_size)
+                .saturating_mul(u64::from(thumbnail_size))
+                .saturating_mul(4),
+        );
+        reader.limits(limits);
+        let image = reader.decode().ok()?.into_rgba8();
+
+        Some(Self::Image(
+            widget::image::Handle::from_rgba(image.width(), image.height(), image.into_raw()),
+            None,
+        ))
     }
 }
 
@@ -2374,6 +2445,13 @@ impl Item {
 
     pub fn path_opt(&self) -> Option<&PathBuf> {
         self.location_opt.as_ref()?.path_opt()
+    }
+
+    fn thumbnail_or_icon(&self, icon: &widget::icon::Handle) -> widget::icon::Handle {
+        self.thumbnail_opt
+            .as_ref()
+            .and_then(ItemThumbnail::icon_handle)
+            .unwrap_or_else(|| icon.clone())
     }
 
     pub fn can_gallery(&self) -> bool {
@@ -2930,6 +3008,59 @@ pub fn parse_hidden_file(path: &PathBuf) -> Box<[String]> {
 }
 
 impl Tab {
+    fn thumbnail_request_size(&self) -> u32 {
+        match self.config.view {
+            View::Grid => u32::from(self.config.icon_sizes.grid()),
+            // Cover both responsive list layouts without using the maximum grid size.
+            View::List => u32::from(
+                self.config
+                    .icon_sizes
+                    .list()
+                    .max(self.config.icon_sizes.list_condensed()),
+            ),
+        }
+    }
+
+    fn thumbnail_retention_rect(&self) -> Rectangle {
+        let size = self.size_opt.get().unwrap_or_else(|| Size::new(0.0, 0.0));
+        let scroll_y = self.scroll_opt.map_or(0.0, |offset| offset.y);
+        let margin = size.height * THUMBNAIL_CACHE_MARGIN_PAGES;
+
+        Rectangle::new(
+            Point::new(0.0, (scroll_y - margin).max(0.0)),
+            Size::new(size.width, size.height + 2.0 * margin),
+        )
+    }
+
+    fn should_load_text_thumbnail(&self, index: usize, preview: bool) -> bool {
+        self.select_focus == Some(index) && (preview || self.gallery)
+    }
+
+    fn evict_offscreen_thumbnails(&mut self) {
+        let retention_rect = self.thumbnail_retention_rect();
+        let focused = self.select_focus;
+        let Some(items) = self.items_opt.as_mut() else {
+            return;
+        };
+
+        for (index, item) in items.iter_mut().enumerate() {
+            let retain = focused == Some(index)
+                || item
+                    .rect_opt
+                    .get()
+                    .is_some_and(|rect| rect.intersects(&retention_rect));
+
+            if !retain
+                && item
+                    .thumbnail_opt
+                    .as_ref()
+                    .is_some_and(ItemThumbnail::retains_content)
+            {
+                item.thumbnail_opt = None;
+            }
+        }
+    }
+
     pub fn new(
         location: Location,
         config: TabConfig,
@@ -4520,6 +4651,7 @@ impl Tab {
             Message::Scroll(viewport) => {
                 self.scroll_opt = Some(viewport.absolute_offset());
                 self.watch_drag = true;
+                self.evict_offscreen_thumbnails();
             }
             Message::ScrollTab(scroll_speed) => {
                 commands.push(Command::Iced(
@@ -4708,29 +4840,20 @@ impl Tab {
                 }
             }
             Message::Thumbnail(path, thumbnail) => {
+                let retention_rect = self.thumbnail_retention_rect();
+                let focused = self.select_focus;
                 if let Some(ref mut items) = self.items_opt {
                     let location = Location::Path(path);
-                    for item in items.iter_mut() {
+                    for (index, item) in items.iter_mut().enumerate() {
                         if item.location_opt.as_ref() == Some(&location) {
-                            let handle_opt = match &thumbnail {
-                                ItemThumbnail::NotImage => None,
-                                ItemThumbnail::Image(handle, _) => Some(widget::icon::Handle {
-                                    symbolic: false,
-                                    data: widget::icon::Data::Image(handle.clone()),
-                                }),
-                                ItemThumbnail::Svg(handle) => Some(widget::icon::Handle {
-                                    symbolic: false,
-                                    data: widget::icon::Data::Svg(handle.clone()),
-                                }),
-                                //TODO: text thumbnails?
-                                ItemThumbnail::Text(_text) => None,
-                            };
-                            if let Some(handle) = handle_opt {
-                                item.icon_handle_grid.clone_from(&handle);
-                                item.icon_handle_list.clone_from(&handle);
-                                item.icon_handle_list_condensed = handle;
-                            }
-                            item.thumbnail_opt = Some(thumbnail);
+                            // Retain content near the viewport or focus, and cache negative results.
+                            let retain = !thumbnail.retains_content()
+                                || focused == Some(index)
+                                || item
+                                    .rect_opt
+                                    .get()
+                                    .is_some_and(|rect| rect.intersects(&retention_rect));
+                            item.thumbnail_opt = retain.then_some(thumbnail);
                             break;
                         }
                     }
@@ -5841,7 +5964,7 @@ impl Tab {
                     //TODO: one focus group per grid item (needs custom widget)
                     let buttons: Vec<Element<Message>> = vec![
                         widget::button::custom(
-                            widget::icon::icon(item.icon_handle_grid.clone())
+                            widget::icon::icon(item.thumbnail_or_icon(&item.icon_handle_grid))
                                 .content_fit(ContentFit::Contain)
                                 .size(icon_sizes.grid()),
                         )
@@ -6007,7 +6130,7 @@ impl Tab {
                     if *row == r && *col == c {
                         let buttons = vec![
                             widget::button::custom(
-                                widget::icon::icon(item.icon_handle_grid.clone())
+                                widget::icon::icon(item.thumbnail_or_icon(&item.icon_handle_grid))
                                     .content_fit(ContentFit::Contain)
                                     .size(icon_sizes.grid()),
                             )
@@ -6232,10 +6355,12 @@ impl Tab {
 
                     let row = if condensed {
                         widget::row::with_children([
-                            widget::icon::icon(item.icon_handle_list_condensed.clone())
-                                .content_fit(ContentFit::Contain)
-                                .size(icon_size)
-                                .into(),
+                            widget::icon::icon(
+                                item.thumbnail_or_icon(&item.icon_handle_list_condensed),
+                            )
+                            .content_fit(ContentFit::Contain)
+                            .size(icon_size)
+                            .into(),
                             widget::column::with_children([
                                 Item::list_display_name(item.display_name.clone()).into(),
                                 //TODO: translate?
@@ -6249,10 +6374,12 @@ impl Tab {
                         .spacing(space_xxs)
                     } else if is_search {
                         widget::row::with_children([
-                            widget::icon::icon(item.icon_handle_list_condensed.clone())
-                                .content_fit(ContentFit::Contain)
-                                .size(icon_size)
-                                .into(),
+                            widget::icon::icon(
+                                item.thumbnail_or_icon(&item.icon_handle_list_condensed),
+                            )
+                            .content_fit(ContentFit::Contain)
+                            .size(icon_size)
+                            .into(),
                             widget::column::with_children([
                                 Item::list_display_name(item.display_name.clone()).into(),
                                 widget::text::caption(match item.path_opt() {
@@ -6275,7 +6402,7 @@ impl Tab {
                         .spacing(space_xxs)
                     } else {
                         widget::row::with_children([
-                            widget::icon::icon(item.icon_handle_list.clone())
+                            widget::icon::icon(item.thumbnail_or_icon(&item.icon_handle_list))
                                 .content_fit(ContentFit::Contain)
                                 .size(icon_size)
                                 .into(),
@@ -6344,10 +6471,12 @@ impl Tab {
                             )
                         } else if condensed {
                             widget::row::with_children([
-                                widget::icon::icon(item.icon_handle_list_condensed.clone())
-                                    .content_fit(ContentFit::Contain)
-                                    .size(icon_size)
-                                    .into(),
+                                widget::icon::icon(
+                                    item.thumbnail_or_icon(&item.icon_handle_list_condensed),
+                                )
+                                .content_fit(ContentFit::Contain)
+                                .size(icon_size)
+                                .into(),
                                 widget::column::with_children([
                                     Item::list_display_name(item.display_name.clone()).into(),
                                     //TODO: translate?
@@ -6361,10 +6490,12 @@ impl Tab {
                             .into()
                         } else if is_search {
                             widget::row::with_children([
-                                widget::icon::icon(item.icon_handle_list_condensed.clone())
-                                    .content_fit(ContentFit::Contain)
-                                    .size(icon_size)
-                                    .into(),
+                                widget::icon::icon(
+                                    item.thumbnail_or_icon(&item.icon_handle_list_condensed),
+                                )
+                                .content_fit(ContentFit::Contain)
+                                .size(icon_size)
+                                .into(),
                                 widget::column::with_children([
                                     Item::list_display_name(item.display_name.clone()).into(),
                                     widget::text::caption(match item.path_opt() {
@@ -6387,7 +6518,7 @@ impl Tab {
                             .into()
                         } else {
                             widget::row::with_children([
-                                widget::icon::icon(item.icon_handle_list.clone())
+                                widget::icon::icon(item.thumbnail_or_icon(&item.icon_handle_list))
                                     .content_fit(ContentFit::Contain)
                                     .size(icon_size)
                                     .into(),
@@ -7061,7 +7192,7 @@ impl Tab {
                 ));
             }
 
-            for item in items {
+            for (index, item) in items.iter().enumerate() {
                 if item.thumbnail_opt.is_some() {
                     // Skip items that already have a mime type and thumbnail
                     continue;
@@ -7080,6 +7211,13 @@ impl Tab {
                     }
                 }
 
+                // Build text content only for the focused Preview or Gallery item.
+                if item.mime.type_() == mime::TEXT
+                    && !self.should_load_text_thumbnail(index, preview)
+                {
+                    continue;
+                }
+
                 let Some(path) = item.path_opt().cloned() else {
                     continue;
                 };
@@ -7096,6 +7234,13 @@ impl Tab {
                     let max_jobs = jobs;
                     let max_mb = u64::from(self.thumb_config.max_mem_mb.get());
                     let max_size = u64::from(self.thumb_config.max_size_mb.get());
+                    let thumbnail_size = self.thumbnail_request_size();
+                    // Serialize built-in image decoding to bound peak memory.
+                    let thumbnail_permits = if mime.type_() == mime::IMAGE {
+                        num_cpus::get().min(4) as u32
+                    } else {
+                        1
+                    };
 
                     // Determine effective memory budget based on image size
                     let (effective_max_mb, effective_jobs) = if mime.type_() == mime::IMAGE {
@@ -7119,11 +7264,15 @@ impl Tab {
                         effective_max_mb: u64,
                         effective_jobs: usize,
                         max_size: u64,
+                        thumbnail_size: u32,
+                        thumbnail_permits: u32,
                     }
 
                     impl Hash for Wrapper {
                         fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
                             self.path.hash(state);
+                            self.thumbnail_size.hash(state);
+                            self.thumbnail_permits.hash(state);
                         }
                     }
 
@@ -7135,6 +7284,8 @@ impl Tab {
                             effective_max_mb,
                             effective_jobs,
                             max_size,
+                            thumbnail_size,
+                            thumbnail_permits,
                         },
                         |wrapper| {
                             let Wrapper {
@@ -7144,6 +7295,8 @@ impl Tab {
                                 effective_max_mb,
                                 effective_jobs,
                                 max_size,
+                                thumbnail_size,
+                                thumbnail_permits,
                             } = wrapper.clone();
                             stream::channel(
                                 1,
@@ -7155,21 +7308,39 @@ impl Tab {
                                     let message = {
                                         let path = path.clone();
 
+                                        // Serialize PDF renderers to bound peak memory.
+                                        let pdf_permit = if ItemThumbnail::is_pdf_mime(&mime) {
+                                            Some(PDF_THUMB_SEMAPHORE.acquire().await.unwrap())
+                                        } else {
+                                            None
+                                        };
+
                                         // Acquire semaphore permit
-                                        let _permit =
-                                            THUMB_SEMAPHORE.acquire().await.unwrap();
+                                        let permit = THUMB_SEMAPHORE
+                                            .acquire_many(thumbnail_permits)
+                                            .await
+                                            .unwrap();
 
                                         tokio::task::spawn_blocking(move || {
+                                            // Hold permits until detached blocking work finishes.
+                                            let _permit = permit;
+                                            let _pdf_permit = pdf_permit;
                                             let start = Instant::now();
                                             let thumbnail = ItemThumbnail::new(
                                                 &path,
                                                 metadata,
                                                 mime,
-                                                THUMBNAIL_SIZE,
+                                                thumbnail_size,
                                                 effective_max_mb,
                                                 effective_jobs,
                                                 max_size,
                                             );
+                                            #[cfg(all(target_os = "linux", target_env = "gnu"))]
+                                            // Release cold pages retained by glibc worker arenas.
+                                            // SAFETY: glibc documents malloc_trim as MT-Safe.
+                                            unsafe {
+                                                libc::malloc_trim(0);
+                                            }
                                             log::debug!(
                                                 "thumbnailed {} in {:?}",
                                                 path.display(),
@@ -7538,6 +7709,7 @@ mod tests {
 
     use cosmic::iced::mouse::ScrollDelta;
     use cosmic::iced::runtime::keyboard::Modifiers;
+    use cosmic::iced::{Point, Rectangle, Size};
     use cosmic::widget;
     use log::{debug, trace};
     use mime_guess::mime;
@@ -7586,6 +7758,91 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    #[test]
+    fn offscreen_thumbnail_content_is_evicted() -> io::Result<()> {
+        let fs = empty_fs()?;
+        for index in 0..3 {
+            fs::File::create(fs.path().join(format!("file-{index}")))?;
+        }
+        let mut tab = Tab::new(
+            Location::Path(fs.path().into()),
+            TabConfig::default(),
+            ThumbCfg::default(),
+            None,
+            widget::Id::unique(),
+            None,
+        );
+        tab.size_opt.set(Some(Size::new(800.0, 100.0)));
+
+        let mut items = scan_path(&fs.path().to_owned(), IconSizes::default());
+        assert_eq!(items.len(), 3);
+        for (index, item) in items.iter_mut().enumerate() {
+            item.rect_opt.set(Some(Rectangle::new(
+                Point::new(0.0, index as f32 * 400.0),
+                Size::new(100.0, 100.0),
+            )));
+            item.thumbnail_opt = Some(if index == 2 {
+                ItemThumbnail::NotImage
+            } else {
+                ItemThumbnail::Text(widget::text_editor::Content::with_text("preview"))
+            });
+        }
+        tab.set_items(items);
+
+        tab.evict_offscreen_thumbnails();
+
+        let items = tab.items_opt().unwrap();
+        assert!(matches!(
+            items[0].thumbnail_opt,
+            Some(ItemThumbnail::Text(_))
+        ));
+        assert!(items[1].thumbnail_opt.is_none());
+        assert!(matches!(
+            items[2].thumbnail_opt,
+            Some(ItemThumbnail::NotImage)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn text_thumbnail_is_loaded_for_preview_or_gallery() -> io::Result<()> {
+        let fs = empty_fs()?;
+        let mut tab = Tab::new(
+            Location::Path(fs.path().into()),
+            TabConfig::default(),
+            ThumbCfg::default(),
+            None,
+            widget::Id::unique(),
+            None,
+        );
+        tab.select_focus = Some(1);
+
+        assert!(tab.should_load_text_thumbnail(1, true));
+        assert!(!tab.should_load_text_thumbnail(1, false));
+        assert!(!tab.should_load_text_thumbnail(0, true));
+
+        tab.gallery = true;
+        assert!(tab.should_load_text_thumbnail(1, false));
+        assert!(!tab.should_load_text_thumbnail(0, false));
+        Ok(())
+    }
+
+    #[test]
+    fn pdf_thumbnail_mime_detection_includes_compressed_variants() {
+        for mime in [
+            "application/pdf",
+            "application/x-bzpdf",
+            "application/x-ext-pdf",
+            "application/x-gzpdf",
+            "application/x-xzpdf",
+        ] {
+            assert!(ItemThumbnail::is_pdf_mime(&mime.parse().unwrap()));
+        }
+        assert!(!ItemThumbnail::is_pdf_mime(
+            &"application/postscript".parse().unwrap()
+        ));
     }
 
     fn tab_history() -> io::Result<(TempDir, Tab, Vec<PathBuf>)> {
