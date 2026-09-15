@@ -26,7 +26,7 @@ use icu::locale::preferences::extensions::unicode::keywords::HourCycle;
 use image::ImageReader;
 use jiff_icu::ConvertFrom;
 use mime_guess::{Mime, mime};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
@@ -1829,7 +1829,7 @@ pub enum Message {
     ShiftPermissions(Option<(PathBuf, u32)>, u32, u32),
     SetSort(HeadingOptions, bool),
     TabComplete(PathBuf, Vec<(String, PathBuf)>),
-    Thumbnail(PathBuf, ItemThumbnail),
+    Thumbnail(PathBuf, u64, ItemThumbnail),
     ToggleSort(HeadingOptions),
     Drop(Option<(Location, ClipboardPaste)>),
     DndHover(Location),
@@ -1963,6 +1963,50 @@ impl ItemMetadata {
             _ => None,
         }
     }
+
+    fn same_file_as(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::Path {
+                    metadata: self_metadata,
+                    ..
+                },
+                Self::Path {
+                    metadata: other_metadata,
+                    ..
+                },
+            ) => {
+                self_metadata.is_dir() == other_metadata.is_dir()
+                    && self_metadata.len() == other_metadata.len()
+                    && self_metadata.modified().ok() == other_metadata.modified().ok()
+            }
+            _ => false,
+        }
+    }
+
+    fn file_id(&self) -> Option<(u64, u64)> {
+        let Self::Path { metadata, .. } = self else {
+            return None;
+        };
+
+        #[cfg(unix)]
+        {
+            Some((metadata.dev(), metadata.ino()))
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            Some((
+                u64::from(metadata.volume_serial_number()?),
+                metadata.file_index()?,
+            ))
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = metadata;
+            None
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -2015,6 +2059,36 @@ impl ItemThumbnail {
                 | "application/x-gzpdf"
                 | "application/x-xzpdf"
         )
+    }
+
+    fn cached(
+        path: &Path,
+        mime: &Mime,
+        thumbnail_size: u32,
+        original_dims: Option<(u32, u32)>,
+    ) -> Option<Self> {
+        let cacher =
+            ThumbnailCacher::new(path, ThumbnailSize::from_pixel_size(thumbnail_size)).ok()?;
+        Self::from_cache(&cacher, mime, original_dims)
+    }
+
+    pub(crate) fn from_cache(
+        cacher: &ThumbnailCacher,
+        mime: &Mime,
+        original_dims: Option<(u32, u32)>,
+    ) -> Option<Self> {
+        match cacher.get_cached_thumbnail() {
+            CachedThumbnail::Valid((thumbnail_path, size)) => {
+                let original_dims =
+                    original_dims.or_else(|| size.map(|s| (s.pixel_size(), s.pixel_size())));
+                Some(Self::Image(
+                    widget::image::Handle::from_path(thumbnail_path),
+                    original_dims,
+                ))
+            }
+            CachedThumbnail::Failed if mime.type_() != mime::IMAGE => Some(Self::NotImage),
+            CachedThumbnail::Failed | CachedThumbnail::RequiresUpdate(_) => None,
+        }
     }
 
     pub fn new(
@@ -2916,6 +2990,7 @@ pub struct Tab {
     watch_drag: bool,
     window_id: Option<window::Id>,
     large_image_manager: LargeImageManager,
+    thumbnail_generations: FxHashMap<PathBuf, u64>,
 }
 
 async fn calculate_dir_size(path: &Path, controller: Controller) -> Result<u64, OperationError> {
@@ -3116,6 +3191,7 @@ impl Tab {
             watch_drag: true,
             window_id,
             large_image_manager: LargeImageManager::new(),
+            thumbnail_generations: FxHashMap::default(),
         }
     }
 
@@ -3139,6 +3215,28 @@ impl Tab {
             .and_then(|items| items.iter().enumerate().find(|i| i.1.highlighted))
             .map(|(i, _)| i);
         let selected = self.selected_locations();
+
+        let mut old_items: FxHashMap<PathBuf, Item> = self
+            .items_opt
+            .take()
+            .map(|old_items| {
+                old_items
+                    .into_iter()
+                    .filter_map(|item| Some((item.path_opt()?.clone(), item)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut old_paths_by_id: FxHashMap<(u64, u64), PathBuf> = FxHashMap::default();
+        for item in old_items.values() {
+            if let Some(path) = item.path_opt().cloned()
+                && let Some(id) = item.metadata.file_id()
+            {
+                old_paths_by_id.entry(id).or_insert(path);
+            }
+        }
+
+        let mut thumbnail_generations = std::mem::take(&mut self.thumbnail_generations);
+
         for item in &mut items {
             item.selected = false;
             if let Some(location) = &item.location_opt
@@ -3146,7 +3244,65 @@ impl Tab {
             {
                 item.selected = true;
             }
+
+            let Some(path) = item.path_opt().cloned() else {
+                continue;
+            };
+            let old_item = old_items.remove(&path).or_else(|| {
+                item.metadata
+                    .file_id()
+                    .and_then(|id| old_paths_by_id.remove(&id))
+                    .and_then(|old_path| old_items.remove(&old_path))
+            });
+            let Some(old_item) = old_item else {
+                if let Some(generation) = thumbnail_generations.get_mut(&path) {
+                    *generation += 1;
+                }
+                continue;
+            };
+
+            let same_path = old_item.path_opt() == Some(&path);
+            if old_item.metadata.same_file_as(&item.metadata) {
+                item.thumbnail_opt = if same_path {
+                    old_item.thumbnail_opt
+                } else if item.metadata.is_dir() {
+                    None
+                } else {
+                    match &old_item.thumbnail_opt {
+                        Some(thumbnail @ (ItemThumbnail::Svg(_) | ItemThumbnail::Text(_))) => {
+                            Some(thumbnail.clone())
+                        }
+                        Some(ItemThumbnail::Image(_, original_dims)) => {
+                            let cached = ItemThumbnail::cached(
+                                &path,
+                                &item.mime,
+                                self.thumbnail_request_size(),
+                                *original_dims,
+                            );
+                            if cached.is_none() {
+                                log::debug!(
+                                    "no cached thumbnail to reuse for renamed {}",
+                                    path.display()
+                                );
+                            }
+                            cached
+                        }
+                        _ => None,
+                    }
+                };
+                item.image_dimensions = old_item.image_dimensions;
+            } else if same_path {
+                *thumbnail_generations.entry(path).or_insert(0) += 1;
+            }
         }
+
+        let paths: FxHashSet<PathBuf> = items
+            .iter()
+            .filter_map(|item| item.path_opt().cloned())
+            .collect();
+        thumbnail_generations.retain(|path, _| paths.contains(path));
+        self.thumbnail_generations = thumbnail_generations;
+
         self.items_opt = Some(items);
         if let Some(i) = highlighted
             .zip(self.items_opt.as_mut())
@@ -3154,6 +3310,17 @@ impl Tab {
         {
             i.highlighted = true;
         }
+    }
+
+    pub fn bump_thumbnail_generation(&mut self, path: &Path) {
+        *self
+            .thumbnail_generations
+            .entry(path.to_path_buf())
+            .or_insert(0) += 1;
+    }
+
+    fn thumbnail_generation(&self, path: &Path) -> u64 {
+        self.thumbnail_generations.get(path).copied().unwrap_or(0)
     }
 
     pub fn cut_selected(&mut self) {
@@ -4839,7 +5006,15 @@ impl Tab {
                     ));
                 }
             }
-            Message::Thumbnail(path, thumbnail) => {
+            Message::Thumbnail(path, generation, thumbnail) => {
+                if generation != self.thumbnail_generation(&path) {
+                    log::debug!(
+                        "ignoring stale thumbnail for {} (generation {generation})",
+                        path.display()
+                    );
+                    return commands;
+                }
+
                 let retention_rect = self.thumbnail_retention_rect();
                 let focused = self.select_focus;
                 if let Some(ref mut items) = self.items_opt {
@@ -7235,6 +7410,7 @@ impl Tab {
                     let max_mb = u64::from(self.thumb_config.max_mem_mb.get());
                     let max_size = u64::from(self.thumb_config.max_size_mb.get());
                     let thumbnail_size = self.thumbnail_request_size();
+                    let generation = self.thumbnail_generation(&path);
                     // Serialize built-in image decoding to bound peak memory.
                     let thumbnail_permits = if mime.type_() == mime::IMAGE {
                         num_cpus::get().min(4) as u32
@@ -7259,6 +7435,7 @@ impl Tab {
                     #[derive(Clone)]
                     struct Wrapper {
                         path: PathBuf,
+                        generation: u64,
                         metadata: ItemMetadata,
                         mime: mime::Mime,
                         effective_max_mb: u64,
@@ -7271,6 +7448,7 @@ impl Tab {
                     impl Hash for Wrapper {
                         fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
                             self.path.hash(state);
+                            self.generation.hash(state);
                             self.thumbnail_size.hash(state);
                             self.thumbnail_permits.hash(state);
                         }
@@ -7279,6 +7457,7 @@ impl Tab {
                     subscriptions.push(Subscription::run_with(
                         Wrapper {
                             path: path.clone(),
+                            generation,
                             metadata,
                             mime,
                             effective_max_mb,
@@ -7290,6 +7469,7 @@ impl Tab {
                         |wrapper| {
                             let Wrapper {
                                 path,
+                                generation,
                                 metadata,
                                 mime,
                                 effective_max_mb,
@@ -7346,7 +7526,7 @@ impl Tab {
                                                 path.display(),
                                                 start.elapsed()
                                             );
-                                            Message::Thumbnail(path, thumbnail)
+                                            Message::Thumbnail(path, generation, thumbnail)
                                         })
                                         .await
                                         .unwrap()
@@ -7803,6 +7983,114 @@ mod tests {
             items[2].thumbnail_opt,
             Some(ItemThumbnail::NotImage)
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn rescan_keeps_unchanged_thumbnails() -> io::Result<()> {
+        let fs = empty_fs()?;
+        let file = fs.path().join("file");
+        fs::write(&file, b"data")?;
+        let mut tab = Tab::new(
+            Location::Path(fs.path().into()),
+            TabConfig::default(),
+            ThumbCfg::default(),
+            None,
+            widget::Id::unique(),
+            None,
+        );
+
+        let mut items = scan_path(&fs.path().to_owned(), IconSizes::default());
+        assert_eq!(items.len(), 1);
+        let path = items[0].path_opt().unwrap().clone();
+        items[0].thumbnail_opt = Some(ItemThumbnail::NotImage);
+        tab.set_items(items);
+        assert!(tab.items_opt().unwrap()[0].thumbnail_opt.is_some());
+
+        // Rescanning an unchanged file keeps its thumbnail.
+        tab.set_items(scan_path(&fs.path().to_owned(), IconSizes::default()));
+        assert!(tab.items_opt().unwrap()[0].thumbnail_opt.is_some());
+        assert_eq!(tab.thumbnail_generation(&path), 0);
+
+        // Changing the contents invalidates the thumbnail and bumps the
+        // generation so in-flight results are discarded.
+        fs::write(&file, b"different data")?;
+        filetime::set_file_mtime(&file, filetime::FileTime::from_unix_time(1_000_000, 0))?;
+        tab.set_items(scan_path(&fs.path().to_owned(), IconSizes::default()));
+        assert!(tab.items_opt().unwrap()[0].thumbnail_opt.is_none());
+        assert_eq!(tab.thumbnail_generation(&path), 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn renamed_file_reuses_item_state() -> io::Result<()> {
+        let fs = empty_fs()?;
+        let old_path = fs.path().join("before");
+        fs::write(&old_path, b"data")?;
+        let mut tab = Tab::new(
+            Location::Path(fs.path().into()),
+            TabConfig::default(),
+            ThumbCfg::default(),
+            None,
+            widget::Id::unique(),
+            None,
+        );
+
+        let mut items = scan_path(&fs.path().to_owned(), IconSizes::default());
+        assert_eq!(items.len(), 1);
+        // Stand-in for state that is otherwise dropped on rescan.
+        items[0].image_dimensions = Some((7, 9));
+        items[0].thumbnail_opt = Some(ItemThumbnail::NotImage);
+        tab.set_items(items);
+
+        fs::rename(&old_path, fs.path().join("after"))?;
+        tab.set_items(scan_path(&fs.path().to_owned(), IconSizes::default()));
+
+        let items = tab.items_opt().unwrap();
+        assert_eq!(items[0].name, "after");
+        // Matched by file identity, so the state is carried over.
+        assert_eq!(items[0].image_dimensions, Some((7, 9)));
+        // No cache entry exists for the test file, so the thumbnail is left
+        // to be generated.
+        assert!(items[0].thumbnail_opt.is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn stale_thumbnail_results_are_ignored() -> io::Result<()> {
+        let fs = empty_fs()?;
+        let file = fs.path().join("file");
+        fs::write(&file, b"data")?;
+        let mut tab = Tab::new(
+            Location::Path(fs.path().into()),
+            TabConfig::default(),
+            ThumbCfg::default(),
+            None,
+            widget::Id::unique(),
+            None,
+        );
+
+        let items = scan_path(&fs.path().to_owned(), IconSizes::default());
+        let path = items[0].path_opt().unwrap().clone();
+        tab.set_items(items);
+
+        // Simulate invalidation while a generation is still in flight.
+        tab.bump_thumbnail_generation(&path);
+        tab.update(
+            Message::Thumbnail(path.clone(), 0, ItemThumbnail::NotImage),
+            Modifiers::empty(),
+        );
+        assert!(tab.items_opt().unwrap()[0].thumbnail_opt.is_none());
+
+        // A result from the current generation is accepted.
+        tab.update(
+            Message::Thumbnail(path, 1, ItemThumbnail::NotImage),
+            Modifiers::empty(),
+        );
+        assert!(tab.items_opt().unwrap()[0].thumbnail_opt.is_some());
+
         Ok(())
     }
 

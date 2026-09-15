@@ -3696,12 +3696,12 @@ impl Application for App {
                 let entities: Box<[_]> = self.tab_model.iter().collect();
                 for entity in entities {
                     if let Some(tab) = self.tab_model.data_mut::<Tab>(entity)
-                        && let Some(path) = tab.location.path_opt()
+                        && let Some(path) = tab.location.path_opt().cloned()
                     {
                         let mut contains_change = false;
                         for event in &events {
                             for event_path in &event.paths {
-                                if event_path.starts_with(path) {
+                                if event_path.starts_with(&path) {
                                     if let notify::EventKind::Modify(
                                         notify::event::ModifyKind::Metadata(_)
                                         | notify::event::ModifyKind::Data(_),
@@ -3709,6 +3709,7 @@ impl Application for App {
                                     {
                                         // If metadata or data changed, find the matching item and reload it
                                         //TODO: this could be further optimized by looking at what exactly changed
+                                        let mut thumbnail_invalidated = false;
                                         if let Some(items) = &mut tab.items_opt {
                                             for item in items.iter_mut() {
                                                 if item.path_opt() == Some(event_path) {
@@ -3720,7 +3721,18 @@ impl Application for App {
                                                                 ..
                                                             } = &mut item.metadata
                                                             {
+                                                                let changed = metadata.len()
+                                                                    != new_metadata.len()
+                                                                    || metadata.modified().ok()
+                                                                        != new_metadata
+                                                                            .modified()
+                                                                            .ok();
                                                                 *metadata = new_metadata;
+                                                                if changed {
+                                                                    item.thumbnail_opt = None;
+                                                                    item.image_dimensions = None;
+                                                                    thumbnail_invalidated = true;
+                                                                }
                                                             }
                                                         }
 
@@ -3732,9 +3744,11 @@ impl Application for App {
                                                             );
                                                         }
                                                     }
-                                                    //TODO item.thumbnail_opt =
                                                 }
                                             }
+                                        }
+                                        if thumbnail_invalidated {
+                                            tab.bump_thumbnail_generation(event_path);
                                         }
                                     } else {
                                         // Any other events reload the whole tab

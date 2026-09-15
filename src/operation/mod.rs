@@ -1,6 +1,7 @@
 use crate::app::{ArchiveType, DialogPage, Message, REPLACE_BUTTON_ID};
 use crate::config::IconSizes;
 use crate::spawn_detached::spawn_detached;
+use crate::thumbnail_cacher::{self, ThumbnailRelocation};
 use crate::{archive, fl, tab};
 use cosmic::iced::futures::channel::mpsc::Sender;
 use cosmic::iced::futures::{self, SinkExt, StreamExt, stream};
@@ -78,6 +79,16 @@ fn get_directory_name(file_name: &str) -> &str {
     file_name
 }
 
+fn thumbnail_tree_root(path: &Path) -> Option<PathBuf> {
+    path.is_dir().then(|| fs::canonicalize(path).ok()).flatten()
+}
+
+fn relocate_directory_thumbnails(old_root: PathBuf, new_root: PathBuf) {
+    drop(tokio::task::spawn_blocking(move || {
+        thumbnail_cacher::relocate_thumbnails_tree(&old_root, &new_root);
+    }));
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ReplaceResult {
     Replace(bool),
@@ -140,9 +151,21 @@ async fn copy_or_move(
                         return Some((from, to));
                     }
 
+                    let relocation = ThumbnailRelocation::new(&from);
+                    let tree_root = thumbnail_tree_root(&from);
                     match compio::fs::rename(&from, &to).await {
                         Ok(()) => {
                             log::info!("renamed {} to {}", from.display(), to.display());
+                            if let Some(relocation) = relocation {
+                                let to_clone = to.clone();
+                                let _ = compio::runtime::spawn_blocking(move || {
+                                    relocation.relocate(&to_clone);
+                                })
+                                .await;
+                            }
+                            if let Some(old_root) = tree_root {
+                                relocate_directory_thumbnails(old_root, to.clone());
+                            }
                             None
                         }
                         Err(err) => {
@@ -880,6 +903,8 @@ impl Operation {
                     compio::runtime::spawn_blocking(move || -> Result<(), OperationError> {
                         let controller = controller_clone;
                         let count = items.len();
+                        let original_paths: Vec<PathBuf> =
+                            items.iter().map(trash::TrashItem::original_path).collect();
                         for (i, item) in items.into_iter().enumerate() {
                             futures::executor::block_on(async {
                                 controller
@@ -892,6 +917,9 @@ impl Operation {
 
                             trash::os_limited::purge_all([item])
                                 .map_err(|e| OperationError::from_err(e, &controller))?;
+                        }
+                        for path in &original_paths {
+                            thumbnail_cacher::remove_thumbnails(path);
                         }
                         Ok(())
                     })
@@ -919,6 +947,7 @@ impl Operation {
                             .map_err(|e| OperationError::from_err(e, &controller))?;
                         let count = items.len();
                         let mut errors: Vec<trash::Error> = Vec::new();
+                        let mut purged_paths: Vec<PathBuf> = Vec::new();
 
                         for (i, item) in items.into_iter().enumerate() {
                             futures::executor::block_on(async {
@@ -928,11 +957,18 @@ impl Operation {
                                     .map_err(|s| OperationError::from_state(s, &controller))
                             })?;
 
+                            let original_path = item.original_path();
                             if let Err(e) = trash::os_limited::purge_all([item]) {
                                 errors.push(e);
+                            } else {
+                                purged_paths.push(original_path);
                             }
 
                             controller.set_progress(i as f32 / count as f32);
+                        }
+
+                        for path in &purged_paths {
+                            thumbnail_cacher::remove_thumbnails(path);
                         }
 
                         // Report errors at the end
@@ -1086,6 +1122,7 @@ impl Operation {
                     controller.set_progress((idx as f32) / (total as f32));
 
                     tokio::task::spawn_blocking(|| {
+                        thumbnail_cacher::remove_thumbnails_recursive(&path);
                         if path.is_symlink() || path.is_file() {
                             fs::remove_file(path)
                         } else if path.is_dir() {
@@ -1124,9 +1161,21 @@ impl Operation {
                         .check()
                         .await
                         .map_err(|s| OperationError::from_state(s, &controller))?;
+                    let relocation = ThumbnailRelocation::new(&from);
+                    let tree_root = thumbnail_tree_root(&from);
                     compio::fs::rename(&from, &to)
                         .await
                         .map_err(|e| OperationError::from_err(e, &controller))?;
+                    if let Some(relocation) = relocation {
+                        let to_clone = to.clone();
+                        let _ = compio::runtime::spawn_blocking(move || {
+                            relocation.relocate(&to_clone);
+                        })
+                        .await;
+                    }
+                    if let Some(old_root) = tree_root {
+                        relocate_directory_thumbnails(old_root, to.clone());
+                    }
                     Result::<_, OperationError>::Ok(OperationSelection {
                         ignored: vec![from],
                         selected: vec![to],

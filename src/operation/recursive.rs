@@ -3,6 +3,7 @@
 
 use super::{Controller, OperationSelection, ReplaceResult, copy_unique_path};
 use crate::operation::{OperationError, sync_to_disk};
+use crate::thumbnail_cacher::ThumbnailRelocation;
 use anyhow::Context as AnyhowContext;
 use compio::BufResult;
 use compio::buf::{IntoInner, IoBuf};
@@ -347,6 +348,14 @@ impl Op {
 
                 if result.is_err() {
                     _ = compio::fs::remove_file(&self.to).await;
+                } else if matches!(&result, Ok(true)) {
+                    if let Some(relocation) = ThumbnailRelocation::new(&self.from) {
+                        let to = self.to.clone();
+                        let _ = compio::runtime::spawn_blocking(move || {
+                            relocation.copy(&to);
+                        })
+                        .await;
+                    }
                 }
 
                 crate::operation::actively_writing_remove(&self.to);
@@ -371,7 +380,15 @@ impl Op {
                 }
                 // This is atomic and ensures `to` is not created by any other process
                 match compio::fs::hard_link(&self.from, &self.to).await {
-                    Ok(()) => {}
+                    Ok(()) => {
+                        if let Some(relocation) = ThumbnailRelocation::new(&self.from) {
+                            let to = self.to.clone();
+                            let _ = compio::runtime::spawn_blocking(move || {
+                                relocation.copy(&to);
+                            })
+                            .await;
+                        }
+                    }
                     Err(err) => {
                         // https://docs.rs/windows-sys/latest/windows_sys/Win32/Foundation/constant.ERROR_NOT_SAME_DEVICE.html
                         #[cfg(windows)]
@@ -402,7 +419,12 @@ impl Op {
                 compio::fs::create_dir_all(&self.to).await?;
             }
             OpKind::Remove => {
+                let relocation = ThumbnailRelocation::new(&self.from);
                 compio::fs::remove_file(&self.from).await?;
+                if let Some(relocation) = relocation {
+                    let _ =
+                        compio::runtime::spawn_blocking(move || relocation.remove_cached()).await;
+                }
             }
             OpKind::Rmdir => {
                 compio::fs::remove_dir(&self.from).await?;
