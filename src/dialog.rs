@@ -202,6 +202,8 @@ pub struct DialogSettings {
     app_id: String,
     kind: DialogKind,
     path_opt: Option<PathBuf>,
+    parent: Option<String>,
+    modal: bool,
 }
 
 impl DialogSettings {
@@ -223,6 +225,16 @@ impl DialogSettings {
         self.path_opt = Some(path);
         self
     }
+
+    pub fn parent(mut self, parent: Option<String>) -> Self {
+        self.parent = parent;
+        self
+    }
+
+    pub fn modal(mut self, modal: bool) -> Self {
+        self.modal = modal;
+        self
+    }
 }
 
 impl Default for DialogSettings {
@@ -231,6 +243,8 @@ impl Default for DialogSettings {
             app_id: App::APP_ID.to_string(),
             kind: DialogKind::OpenFile,
             path_opt: None,
+            parent: None,
+            modal: false,
         }
     }
 }
@@ -268,6 +282,11 @@ impl<M: Send + 'static> Dialog<M> {
         }
 
         let (window_id, window_command) = window::open(settings);
+        let dialog_command = cosmic::window::set_dialog(
+            window_id,
+            dialog_settings.parent.clone(),
+            dialog_settings.modal,
+        );
 
         let mut core = Core::default();
         core.set_main_window_id(Some(window_id));
@@ -296,6 +315,7 @@ impl<M: Send + 'static> Dialog<M> {
             },
             Task::batch([
                 window_command.map(|_id| cosmic::action::none()),
+                dialog_command.map(|()| cosmic::action::none()),
                 cosmic_command
                     .map(DialogMessage)
                     .map(move |message| cosmic::action::app(mapper(message))),

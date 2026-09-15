@@ -76,7 +76,7 @@ features = ["fs", "io", "macros", "polling", "runtime"]
 
 [dependencies.libcosmic]
 git = "https://github.com/hahnavi/libcosmic.git"
-rev = "ba613c3b355ce858bfac9cc43812c019562539a0"
+rev = "a370eb67a23470dd5de584c9905f2af31f17287f"
 default-features = false
 #TODO: a11y feature crashes
 features = [
