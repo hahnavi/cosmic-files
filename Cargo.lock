@@ -1435,14 +1435,14 @@ dependencies = [
 
 [[package]]
 name = "cosmic-files"
-version = "1.8.0"
+version = "1.9.0"
 dependencies = [
  "anyhow",
  "atomic_float",
  "bstr",
  "bzip2",
  "compio",
- "cosmic-client-toolkit 0.2.0 (git+https://github.com/pop-os/cosmic-protocols?rev=32283d7)",
+ "cosmic-client-toolkit 0.2.0 (git+https://github.com/pop-os/cosmic-protocols?rev=c0cff4d)",
  "cosmic-mime-apps",
  "dirs 6.0.0",
  "fastrand",
@@ -1504,7 +1504,7 @@ dependencies = [
 
 [[package]]
 name = "cosmic-files-applet"
-version = "1.8.0"
+version = "1.9.0"
 dependencies = [
  "cosmic-files",
  "log",
