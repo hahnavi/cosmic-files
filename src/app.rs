@@ -2760,8 +2760,8 @@ impl Application for App {
 
     fn on_context_drawer(&mut self) -> Task<Self::Message> {
         if let ContextPage::Preview(..) = self.context_page {
-            // Persist state of preview page
-            if self.core.window.show_context != self.config.show_details {
+            // Persist state of preview page, ignoring a close animation still in progress
+            if self.core.context_drawer_open() != self.config.show_details {
                 return self.update(Message::Preview(None));
             }
         }
@@ -4190,7 +4190,7 @@ impl Application for App {
                     Mode::App => {
                         let show_details = !self.config.show_details;
                         self.context_page = ContextPage::Preview(None, PreviewKind::Selected);
-                        self.core.window.show_context = show_details;
+                        self.set_show_context(show_details);
                         return cosmic::task::message(Message::SetShowDetails(show_details));
                     }
                     Mode::Desktop => {
@@ -4762,18 +4762,19 @@ impl Application for App {
             }
             Message::ToggleContextPage(context_page) => {
                 //TODO: ensure context menus are closed
-                if self.context_page == context_page
+                let show_context = if self.context_page == context_page
                     || matches!(self.context_page, ContextPage::Preview(_, _))
                 {
-                    self.set_show_context(!self.core.window.show_context);
+                    !self.core.context_drawer_open()
                 } else {
-                    self.set_show_context(true);
-                }
+                    true
+                };
+                self.set_show_context(show_context);
                 self.context_page = context_page;
                 // Preview status is preserved across restarts
                 if matches!(self.context_page, ContextPage::Preview(_, _)) {
                     return cosmic::task::message(cosmic::action::app(Message::SetShowDetails(
-                        self.core.window.show_context,
+                        show_context,
                     )));
                 }
             }
@@ -7339,6 +7340,102 @@ pub(crate) mod test_utils {
             "Path ({}) and Tab path ({}) don't have equal contents",
             path.display(),
             tab_path.display()
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_app() -> App {
+        let flags = Flags {
+            config_handler: None,
+            config: Config::default(),
+            state_handler: None,
+            state: State::default(),
+            mode: Mode::App,
+            locations: Vec::new(),
+            uris: Vec::new(),
+        };
+
+        App::init(Core::default(), flags).0
+    }
+
+    /// Applies the messages a task produces, as the runtime would
+    fn run_task(app: &mut App, task: Task<Message>) {
+        use cosmic::iced::futures::StreamExt;
+        use cosmic::iced::runtime::Action as RuntimeAction;
+
+        let Some(mut stream) = cosmic::iced::runtime::task::into_stream(task) else {
+            return;
+        };
+
+        while let Some(action) = cosmic::iced::futures::executor::block_on(stream.next()) {
+            if let RuntimeAction::Output(action) = action
+                && let cosmic::Action::App(message) = action
+            {
+                let task = app.update(message);
+                run_task(app, task);
+            }
+        }
+    }
+
+    /// The details pane animates when it is toggled, and remains in the view while it
+    /// animates away so that it slides out instead of disappearing.
+    #[tokio::test]
+    async fn details_pane_animates_when_toggled() {
+        let mut app = test_app();
+
+        assert!(!app.core.context_drawer_open());
+        assert!(app.context_drawer().is_none());
+
+        // The "show details" toggle opens the pane with an animation
+        _ = app.update(Message::Preview(None));
+        assert!(app.core.context_drawer_open());
+        assert!(
+            app.core.context_animation_active(),
+            "the details pane must animate when it is opened"
+        );
+        assert!(app.context_drawer().is_some());
+
+        // Toggling again closes it, and it remains in the view until the animation ends
+        let task = app.update(Message::SetShowDetails(true));
+        run_task(&mut app, task);
+        let task = app.update(Message::Preview(None));
+        run_task(&mut app, task);
+        assert!(!app.config.show_details, "closing must be persisted");
+        assert!(!app.core.context_drawer_open());
+        assert!(
+            app.core.window.show_context,
+            "the drawer must remain in the view while it animates away"
+        );
+        assert!(
+            app.core.context_animation_active(),
+            "the details pane must animate when it is closed"
+        );
+        assert!(app.context_drawer().is_some());
+    }
+
+    /// Closing the preview page must be persisted, even though the drawer is still
+    /// rendered while its close animation runs.
+    #[tokio::test]
+    async fn closing_preview_page_is_persisted() {
+        let mut app = test_app();
+        let page = ContextPage::Preview(None, PreviewKind::Selected);
+
+        let task = app.update(Message::ToggleContextPage(page.clone()));
+        run_task(&mut app, task);
+        assert!(app.core.context_drawer_open());
+        assert!(app.config.show_details);
+
+        let task = app.update(Message::ToggleContextPage(page));
+        run_task(&mut app, task);
+        assert!(!app.core.context_drawer_open());
+        assert!(!app.config.show_details, "closing must be persisted");
+        assert!(
+            app.core.window.show_context,
+            "the drawer must remain in the view while it animates away"
         );
     }
 }

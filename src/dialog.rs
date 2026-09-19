@@ -841,7 +841,10 @@ impl App {
     }
 
     fn update_config(&mut self) -> Task<Message> {
-        self.core.window.show_context = self.flags.config.dialog.show_details;
+        let show_details = self.flags.config.dialog.show_details;
+        if self.core.window.show_context != show_details {
+            self.core.set_show_context(show_details);
+        }
         let config = self.flags.config.dialog_tab();
         self.tab.config.view = config.view;
         self.update_nav_model();
@@ -1077,6 +1080,8 @@ impl Application for App {
             type_select_last_key: None,
         };
 
+        app.core.window.show_context = app.flags.config.dialog.show_details;
+
         let commands = Task::batch([
             app.update_config(),
             app.update_title(),
@@ -1259,7 +1264,7 @@ impl Application for App {
         }
 
         let show_details = match self.context_page {
-            ContextPage::Preview(..) => self.core.window.show_context,
+            ContextPage::Preview(..) => self.core.context_drawer_open(),
             _ => false,
         };
         elements
