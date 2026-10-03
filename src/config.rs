@@ -246,6 +246,7 @@ impl Config {
             icon_sizes: self.dialog.icon_sizes,
             military_time: self.tab.military_time,
             show_hidden: self.dialog.show_hidden,
+            show_status_bar: self.tab.show_status_bar,
             single_click: false,
             view: self.dialog.view,
         }
@@ -366,6 +367,8 @@ pub struct TabConfig {
     pub military_time: bool,
     /// Show hidden files and folders
     pub show_hidden: bool,
+    /// Show the status bar at the bottom of the pane
+    pub show_status_bar: bool,
     /// Single click to open
     pub single_click: bool,
     /// Selected view, grid or list
@@ -379,6 +382,7 @@ impl Default for TabConfig {
             icon_sizes: IconSizes::default(),
             military_time: false,
             show_hidden: false,
+            show_status_bar: true,
             single_click: false,
             view: View::List,
         }

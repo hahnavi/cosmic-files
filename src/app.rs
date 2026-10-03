@@ -80,7 +80,7 @@ use crate::tab::{
     SearchLocation, Tab,
 };
 use crate::trash::{Trash, TrashExt};
-use crate::zoom::{zoom_in_view, zoom_out_view, zoom_to_default};
+use crate::zoom::{zoom_in_view, zoom_out_view, zoom_set, zoom_to_default};
 use crate::{FxOrderMap, context_action, fl, home_dir, menu, mime_icon};
 
 static PERMANENT_DELETE_BUTTON_ID: LazyLock<widget::Id> =
@@ -191,11 +191,13 @@ pub enum Action {
     ToggleFoldersFirst,
     ToggleShowHidden,
     ToggleSort(HeadingOptions),
+    ToggleStatusBar,
     WindowClose,
     WindowNew,
     ZoomDefault,
     ZoomIn,
     ZoomOut,
+    ZoomSet(NonZeroU16),
     Recents,
 }
 
@@ -269,6 +271,7 @@ impl Action {
             Self::TabViewList => Message::TabView(entity_opt, tab::View::List),
             Self::ToggleFoldersFirst => Message::ToggleFoldersFirst,
             Self::ToggleShowHidden => Message::ToggleShowHidden,
+            Self::ToggleStatusBar => Message::ToggleStatusBar,
             Self::ToggleSort(sort) => {
                 Message::TabMessage(entity_opt, tab::Message::ToggleSort(*sort))
             }
@@ -277,6 +280,7 @@ impl Action {
             Self::ZoomDefault => Message::ZoomDefault(entity_opt),
             Self::ZoomIn => Message::ZoomIn(entity_opt),
             Self::ZoomOut => Message::ZoomOut(entity_opt),
+            Self::ZoomSet(zoom) => Message::ZoomSet(entity_opt, *zoom),
             Self::Recents => Message::Recents,
         }
     }
@@ -458,6 +462,7 @@ pub enum Message {
     ToggleContextPage(ContextPage),
     ToggleFoldersFirst,
     ToggleShowHidden,
+    ToggleStatusBar,
     Undo(usize),
     UndoTrash(widget::ToastId, Arc<[PathBuf]>),
     UndoTrashStart(Vec<TrashItem>),
@@ -468,6 +473,7 @@ pub enum Message {
     ZoomDefault(Option<Entity>),
     ZoomIn(Option<Entity>),
     ZoomOut(Option<Entity>),
+    ZoomSet(Option<Entity>, NonZeroU16),
     DndHoverLocTimeout(Location),
     DndHoverTabTimeout(Entity),
     DndEnterNav(Entity),
@@ -4479,10 +4485,18 @@ impl Application for App {
                 config.show_hidden = !config.show_hidden;
                 return self.update(Message::TabConfig(config));
             }
+            Message::ToggleStatusBar => {
+                let mut config = self.config.tab;
+                config.show_status_bar = !config.show_status_bar;
+                return self.update(Message::TabConfig(config));
+            }
             Message::TabMessage(entity_opt, tab_message) => {
                 let entity = entity_opt.unwrap_or_else(|| self.tab_model.active());
-                // The context menu opens on right-button release, so refresh paste availability now
-                let right_click = matches!(tab_message, tab::Message::RightClick(..));
+                // Refresh paste availability when a right-click context menu opens.
+                let right_click = matches!(
+                    tab_message,
+                    tab::Message::RightClick(..) | tab::Message::FileContextMenuOpened
+                );
 
                 let tab_commands = match self.tab_model.data_mut::<Tab>(entity) {
                     Some(tab) => tab.update(tab_message, self.modifiers),
@@ -4892,6 +4906,14 @@ impl Application for App {
                 let mut config = self.config.tab;
                 if let Some(tab) = self.tab_model.data::<Tab>(entity) {
                     zoom_out_view(tab.config.view, &mut config.icon_sizes);
+                }
+                return self.update(Message::TabConfig(config));
+            }
+            Message::ZoomSet(entity_opt, zoom) => {
+                let entity = entity_opt.unwrap_or_else(|| self.tab_model.active());
+                let mut config = self.config.tab;
+                if let Some(tab) = self.tab_model.data::<Tab>(entity) {
+                    zoom_set(tab.config.view, &mut config.icon_sizes, zoom);
                 }
                 return self.update(Message::TabConfig(config));
             }
@@ -6506,8 +6528,8 @@ impl Application for App {
             tab_column = tab_column.push(
                 widget::container(
                     widget::tab_bar::horizontal(&self.tab_model)
-                        .button_height(32)
-                        .button_spacing(space_xxs)
+                        .button_height(36)
+                        .button_spacing(space_s)
                         .enable_tab_drag(String::from("x-cosmic-files/tab-dnd"))
                         .on_reorder(Message::ReorderTab)
                         .tab_drag_threshold(25.)
@@ -6520,9 +6542,34 @@ impl Application for App {
                         })
                         .drag_id(self.tab_drag_id),
                 )
+                .class(theme::Container::Custom(Box::new(|theme| {
+                    let cosmic = theme.cosmic();
+                    iced::widget::container::Style {
+                        icon_color: Some(iced::Color::from(
+                            cosmic.background(theme.transparent).on,
+                        )),
+                        text_color: Some(iced::Color::from(
+                            cosmic.background(theme.transparent).on,
+                        )),
+                        background: Some(iced::Background::Color(
+                            cosmic.background(theme.transparent).base.into(),
+                        )),
+                        border: iced::Border::default(),
+                        shadow: iced::Shadow::default(),
+                        snap: true,
+                    }
+                })))
                 .width(Length::Fill)
-                .padding([0, space_s]),
+                .padding([0, 0, 0, space_xxs]),
             );
+            tab_column = tab_column.push(widget::divider::horizontal::default().class(
+                theme::Rule::custom(|theme| iced::widget::rule::Style {
+                    color: theme.cosmic().accent.base.into(),
+                    radius: 0.0.into(),
+                    fill_mode: iced::widget::rule::FillMode::Full,
+                    snap: true,
+                }),
+            ));
         }
 
         let entity = self.tab_model.active();
@@ -6533,6 +6580,7 @@ impl Application for App {
                     &self.modifiers,
                     self.clipboard_has_content(),
                     &self.config.context_actions,
+                    tab::PaneSettings::new(&self.core, self.config.show_details),
                 )
                 .map(move |message| Message::TabMessage(Some(entity), message));
             tab_column = tab_column.push(tab_view);
@@ -6563,6 +6611,7 @@ impl Application for App {
                                 &window.modifiers,
                                 self.clipboard_has_content(),
                                 &self.config.context_actions,
+                                tab::PaneSettings::new(&self.core, self.config.show_details),
                             )
                             .map(move |message| Message::TabMessage(Some(*entity), message)),
                         None => widget::space::vertical().into(),
@@ -7437,5 +7486,19 @@ mod tests {
             app.core.window.show_context,
             "the drawer must remain in the view while it animates away"
         );
+    }
+
+    #[tokio::test]
+    async fn status_bar_toggle_is_persisted() {
+        let mut app = test_app();
+        assert!(app.config.tab.show_status_bar);
+
+        let task = app.update(Message::ToggleStatusBar);
+        run_task(&mut app, task);
+        assert!(!app.config.tab.show_status_bar);
+
+        let task = app.update(Message::ToggleStatusBar);
+        run_task(&mut app, task);
+        assert!(app.config.tab.show_status_bar);
     }
 }

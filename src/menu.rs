@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-use cosmic::{Element, theme};
 use cosmic::app::Core;
 use cosmic::iced::keyboard::Modifiers;
 use cosmic::widget::menu::action::MenuAction;
 use cosmic::widget::menu::key_bind::KeyBind;
 use cosmic::widget::menu::{self, ItemHeight, ItemWidth, MenuBar};
 use cosmic::widget::{self, responsive_menu_bar};
+use cosmic::{Element, theme};
 use i18n_embed::LanguageLoader;
 use mime_guess::Mime;
 use std::collections::HashMap;
@@ -85,8 +85,11 @@ pub fn context_menu<'a>(
     let mut selected_mount_point = 0;
     let mut any_trash_item = false;
     if let Some(items) = tab.items_opt() {
-        for item in items {
-            if item.selected {
+        // Predict the selection produced by the opening right-click. This keeps the menu's item
+        // tree stable when FileContextMenuOpened applies that selection.
+        let context_selection = tab.context_menu_selection(modifiers);
+        for (index, item) in items.iter().enumerate() {
+            if context_selection.get(index).copied().unwrap_or(false) {
                 selected += 1;
                 if item.metadata.is_dir() {
                     selected_mount_point += i32::from(item.is_mount_point);
@@ -696,6 +699,12 @@ pub fn menu_bar<'a>(
                             None,
                             config.show_details,
                             Action::Preview,
+                        ),
+                        menu::Item::CheckBox(
+                            fl!("show-status-bar"),
+                            None,
+                            tab_opt.is_some_and(|tab| tab.config.show_status_bar),
+                            Action::ToggleStatusBar,
                         ),
                         menu::Item::Divider,
                         menu_button_optional(

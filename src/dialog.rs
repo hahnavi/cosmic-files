@@ -1961,7 +1961,13 @@ impl Application for App {
 
         col = col.push(
             self.tab
-                .view(&self.key_binds, &self.modifiers, false, &[])
+                .view(
+                    &self.key_binds,
+                    &self.modifiers,
+                    false,
+                    &[],
+                    tab::PaneSettings::new(&self.core, self.flags.config.dialog.show_details),
+                )
                 .map(Message::TabMessage),
         );
 

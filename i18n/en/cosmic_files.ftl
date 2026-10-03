@@ -384,9 +384,21 @@ grid-view = Grid view
 list-view = List view
 show-hidden-files = Show hidden files
 list-directories-first = List directories first
+show-status-bar = Show status bar
 gallery-preview = Gallery preview
 menu-settings = Settings...
 menu-about = About COSMIC Files...
+
+## Status bar
+status-bar-items = {$items ->
+    [one] {$items} item
+    *[other] {$items} items
+  }
+status-bar-items-selected = {$items ->
+    [one] {$items} item selected
+    *[other] {$items} items selected
+  }
+status-bar-selection-size = ({$size})
 
 ## Sort
 sort = Sort

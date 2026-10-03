@@ -11,8 +11,8 @@ use cosmic::iced::keyboard::Modifiers;
 use cosmic::iced::widget::scrollable::{self, AbsoluteOffset, Viewport};
 use cosmic::iced::widget::{rule, stack};
 use cosmic::iced::{
-    Alignment, Border, Color, ContentFit, Length, Point, Rectangle, Size, Subscription, Vector,
-    padding, stream, window,
+    Alignment, Background, Border, Color, ContentFit, Length, Padding, Point, Rectangle, Size,
+    Subscription, Vector, padding, stream, window,
 };
 use cosmic::widget::menu::action::MenuAction;
 use cosmic::widget::menu::key_bind::KeyBind;
@@ -38,6 +38,7 @@ use std::fmt::{self, Display};
 use std::fs::{self, File, Metadata};
 use std::hash::Hash;
 use std::io::{BufRead, BufReader, Read};
+use std::num::NonZeroU16;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{self, Path, PathBuf};
@@ -66,6 +67,7 @@ use crate::operation::{Controller, OperationError};
 use crate::thumbnail_cacher::{CachedThumbnail, ThumbnailCacher, ThumbnailSize};
 use crate::thumbnailer::thumbnailer;
 use crate::trash::{Trash, TrashExt};
+use crate::zoom::{MAX_ZOOM, MIN_ZOOM, ZOOM_STEP};
 use crate::{FxOrderMap, fl, menu, mime_app, mouse_area};
 
 pub const DOUBLE_CLICK_DURATION: Duration = Duration::from_millis(500);
@@ -83,6 +85,97 @@ const TEXT_PREVIEW_MAX_BYTES: usize = 32 * 1024; // 32 KiB
 const TEXT_PREVIEW_MAX_FILE_BYTES: u64 = 8 * 1000 * 1000; // 8 MiB
 /// Number of extra viewport pages to retain thumbnails on each side.
 const THUMBNAIL_CACHE_MARGIN_PAGES: f32 = 1.0;
+/// Width of the zoom slider in the status bar.
+const STATUS_BAR_ZOOM_SLIDER_WIDTH: f32 = 120.0;
+/// Size of the zoom slider's handle. The theme's default handle is large enough to dominate the
+/// bar, so it is capped to match the icon buttons beside it. The theme draws the handle with a
+/// 3px transparent border inside its bounds, so the visible handle is 6px smaller than this.
+const STATUS_BAR_ZOOM_HANDLE_SIZE: f32 = 22.0;
+/// Icon size of the status bar's buttons, which are the tallest widgets in the bar.
+const STATUS_BAR_ICON_SIZE: f32 = 16.0;
+/// Number of buttons in the status bar: zoom out, zoom in, list, grid and details.
+const STATUS_BAR_BUTTONS: f32 = 5.0;
+
+/// Height of the status bar's controls: its icon buttons, which the zoom slider is sized to match.
+fn status_bar_controls_height() -> f32 {
+    STATUS_BAR_ICON_SIZE + 2.0 * f32::from(theme::spacing().space_xxs)
+}
+
+/// Height of the status bar, which the item view excludes when scrolling items into view.
+fn status_bar_height() -> f32 {
+    status_bar_controls_height() + 2.0 * f32::from(theme::spacing().space_xxs)
+}
+
+/// Inset the core applies around the panes, which the status bar matches at the bottom so that it
+/// lines up with the sidebar and the details pane. This is not the theme spacing, which shrinks
+/// with the interface density while the panes keep this inset.
+fn core_border_padding(core: &cosmic::app::Core) -> f32 {
+    f32::from(
+        core.window
+            .border_padding
+            .unwrap_or(if core.window.is_maximized { 8 } else { 7 }),
+    )
+}
+
+/// Settings the core gives the pane, which a [`Tab`] cannot read from its own config.
+#[derive(Clone, Copy, Debug)]
+pub struct PaneSettings {
+    /// Whether the details pane is open, which the status bar's details button reflects.
+    pub show_details: bool,
+    /// Inset the core applies around the panes, which the status bar keeps at its bottom.
+    pub border_padding: f32,
+}
+
+impl PaneSettings {
+    /// Reads the pane settings from the core and the app config.
+    pub fn new(core: &cosmic::app::Core, show_details: bool) -> Self {
+        Self {
+            show_details,
+            border_padding: core_border_padding(core),
+        }
+    }
+}
+
+/// Width the status bar's controls need, which the counts and the zoom slider give way to when the
+/// pane is narrower. This must be kept in sync with the row built in [`Tab::status_bar`].
+fn status_bar_controls_width(zoom_slider: bool) -> f32 {
+    let cosmic_theme::Spacing {
+        space_xxs,
+        space_xs,
+        ..
+    } = theme::spacing();
+
+    // The icon buttons are square, and there is a gap between every child of the row.
+    let buttons = STATUS_BAR_BUTTONS * status_bar_controls_height();
+    let spacing = (STATUS_BAR_BUTTONS + 3.0) * f32::from(space_xxs) + 2.0 * f32::from(space_xs);
+    let padding = 2.0 * f32::from(space_xs);
+    let slider = if zoom_slider {
+        STATUS_BAR_ZOOM_SLIDER_WIDTH
+    } else {
+        0.0
+    };
+
+    buttons + spacing + padding + slider
+}
+
+/// Minimum width of the pane for the status bar to show the item counts, which the controls take
+/// precedence over when space is tight. The counts are clipped rather than wrapped, so this only
+/// has to leave room for a short one.
+fn min_status_bar_text_width() -> f32 {
+    status_bar_controls_width(true) + 8.0 * f32::from(theme::spacing().space_xs)
+}
+
+/// Numbers the status bar reports about the contents of a location.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct StatusBarCounts {
+    /// Number of items the view shows, which leaves out the hidden items unless they are shown.
+    items: usize,
+    /// Number of those items that are selected.
+    selected: usize,
+    /// Total size of the selected files, or `None` when none of them reports a size. Directories do
+    /// not, unless the details pane has asked for the size of their contents.
+    selected_size: Option<u64>,
+}
 
 // Thumbnail generation semaphore - limits parallel thumbnail workers
 // Uses 4 workers for balanced throughput and memory usage
@@ -1780,6 +1873,8 @@ pub enum Message {
     ClickRelease(Option<usize>),
     Config(TabConfig),
     ContextAction(Action),
+    FileContextMenuClosed,
+    FileContextMenuOpened,
     RightClickBackground,
     Surface(cosmic::surface::Action<Message>),
     LocationContextMenuIndex(Option<usize>),
@@ -1828,8 +1923,10 @@ pub enum Message {
     SetPermissions(PathBuf, u32),
     ShiftPermissions(Option<(PathBuf, u32)>, u32, u32),
     SetSort(HeadingOptions, bool),
+    SetView(View),
     TabComplete(PathBuf, Vec<(String, PathBuf)>),
     Thumbnail(PathBuf, u64, ItemThumbnail),
+    ToggleDetails,
     ToggleSort(HeadingOptions),
     Drop(Option<(Location, ClipboardPaste)>),
     DndHover(Location),
@@ -1839,6 +1936,7 @@ pub enum Message {
     WindowToggleMaximize,
     ZoomIn,
     ZoomOut,
+    ZoomSet(u16),
     HighlightDeactivate(usize),
     HighlightActivate(usize),
     DirectorySize(PathBuf, DirSize),
@@ -2983,6 +3081,7 @@ pub struct Tab {
     clicked: Option<usize>,
     selected_clicked: bool,
     last_right_click: Option<usize>,
+    context_menu_selection_opt: Option<Vec<bool>>,
     search_context: Option<SearchContext>,
     date_time_formatter: DateTimeFormatter<fieldsets::YMDT>,
     time_formatter: DateTimeFormatter<fieldsets::T>,
@@ -3182,6 +3281,7 @@ impl Tab {
             dnd_hovered: None,
             selected_clicked: false,
             last_right_click: None,
+            context_menu_selection_opt: None,
             search_context: None,
             date_time_formatter: date_time_formatter(config.military_time),
             time_formatter: time_formatter(config.military_time),
@@ -3203,6 +3303,78 @@ impl Tab {
 
     pub const fn items_opt_mut(&mut self) -> Option<&mut Vec<Item>> {
         self.items_opt.as_mut()
+    }
+
+    /// Predicts the selection used to build a file context menu after a right-click.
+    /// The context-menu widget opens before it publishes `FileContextMenuOpened`, so this keeps
+    /// the menu's item tree consistent with the selection update that follows.
+    pub(crate) fn context_menu_selection(&self, modifiers: &Modifiers) -> Vec<bool> {
+        if let Some(selection) = &self.context_menu_selection_opt {
+            return selection.clone();
+        }
+
+        let Some(items) = self.items_opt.as_ref() else {
+            return Vec::new();
+        };
+
+        let mut selected: Vec<_> = items.iter().map(|item| item.selected).collect();
+        let Some(click_i) = items.iter().position(|item| item.highlighted) else {
+            // A right-click on the background clears the current selection.
+            selected.fill(false);
+            return selected;
+        };
+
+        let mod_ctrl = modifiers.contains(Modifiers::CTRL) && self.mode.multiple();
+        let mod_shift = modifiers.contains(Modifiers::SHIFT) && self.mode.multiple();
+
+        if mod_shift {
+            let range = self
+                .select_range
+                .map_or((click_i, click_i), |range| (range.0, click_i));
+            let range_min = range.0.min(range.1);
+            let range_max = range.0.max(range.1);
+            let indices: Vec<_> = self
+                .column_sort()
+                .map(|sorted| sorted.into_iter().map(|(index, _)| index).collect())
+                .unwrap_or_else(|| (0..items.len()).collect());
+            let min = indices
+                .iter()
+                .copied()
+                .position(|index| index == range_min)
+                .unwrap_or_default();
+            let max = indices
+                .iter()
+                .copied()
+                .position(|index| index == range_max)
+                .unwrap_or(indices.len());
+            let min_real = min.min(max);
+            let max_real = max.max(min);
+
+            for index in indices
+                .into_iter()
+                .skip(min_real)
+                .take(max_real - min_real + 1)
+            {
+                if let Some(item) = items.get(index)
+                    && (!item.hidden || self.config.show_hidden)
+                {
+                    selected[index] = true;
+                }
+            }
+        } else if mod_ctrl {
+            selected[click_i] = true;
+        } else if !selected[click_i] {
+            selected.fill(false);
+            selected[click_i] = true;
+        }
+
+        // Right-click selection always keeps the target selected, including in file dialogs.
+        if !selected[click_i] {
+            selected.fill(false);
+            selected[click_i] = true;
+        }
+
+        selected
     }
 
     pub fn set_items(&mut self, mut items: Vec<Item>) {
@@ -3828,6 +4000,23 @@ impl Tab {
         }
     }
 
+    fn select_right_clicked_item(&mut self, click_i_opt: Option<usize>, modifiers: Modifiers) {
+        let mod_ctrl = modifiers.contains(Modifiers::CTRL) && self.mode.multiple();
+        let mod_shift = modifiers.contains(Modifiers::SHIFT) && self.mode.multiple();
+
+        if mod_ctrl || mod_shift {
+            self.update(Message::Click(click_i_opt), modifiers);
+        }
+        if let Some(ref mut items) = self.items_opt
+            && !click_i_opt.is_some_and(|click_i| items.get(click_i).is_some_and(|x| x.selected))
+        {
+            // If item not selected, clear selection on other items
+            for (i, item) in items.iter_mut().enumerate() {
+                item.selected = Some(i) == click_i_opt;
+            }
+        }
+    }
+
     pub fn update(&mut self, message: Message, modifiers: Modifiers) -> Vec<Command> {
         let mut commands = Vec::new();
         let mut cd = None;
@@ -4067,6 +4256,24 @@ impl Tab {
                         item.selected = false;
                     }
                 }
+            }
+            Message::FileContextMenuClosed => {
+                self.context_menu_selection_opt = None;
+            }
+            Message::FileContextMenuOpened => {
+                // The context-menu widget captures the right-click before file rows receive it.
+                // Use the hover state, which is updated as the pointer moves over the rows, to
+                // recover the clicked item when the menu reports that it opened.
+                self.edit_location = None;
+                self.context_menu_selection_opt =
+                    Some(self.context_menu_selection(&modifiers));
+                let click_i_opt = self
+                    .items_opt
+                    .as_ref()
+                    .and_then(|items| items.iter().position(|item| item.highlighted));
+                self.select_right_clicked_item(click_i_opt, modifiers);
+                // The context-menu widget consumes the press before the background handler runs.
+                self.last_right_click = None;
             }
             Message::Surface(action) => {
                 commands.push(Command::Surface(action));
@@ -4718,18 +4925,7 @@ impl Tab {
                 ));
             }
             Message::RightClick(_point_opt, click_i_opt) => {
-                if mod_ctrl || mod_shift {
-                    self.update(Message::Click(click_i_opt), modifiers);
-                }
-                if let Some(ref mut items) = self.items_opt
-                    && !click_i_opt
-                        .is_some_and(|click_i| items.get(click_i).is_some_and(|x| x.selected))
-                {
-                    // If item not selected, clear selection on other items
-                    for (i, item) in items.iter_mut().enumerate() {
-                        item.selected = Some(i) == click_i_opt;
-                    }
-                }
+                self.select_right_clicked_item(click_i_opt, modifiers);
                 //TODO: hack for clearing selecting when right clicking empty space
                 self.last_right_click = click_i_opt;
             }
@@ -4774,6 +4970,10 @@ impl Tab {
                 }
             }
             Message::Resize(viewport) => {
+                // The item view reports the area it is visible in, which is what the scroll math
+                // needs to keep items out from under the status bar.
+                self.item_view_size_opt.set(Some(viewport.size()));
+
                 // Scroll to ensure focused item still in view
                 if self.viewport_opt.map(|v| v.size()) != Some(viewport.size())
                     && let Some(offset) = self.select_focus_scroll()
@@ -4973,6 +5173,12 @@ impl Tab {
                     }
                 }
             }
+            Message::SetView(view) => {
+                commands.push(Command::Action(match view {
+                    View::Grid => Action::TabViewGrid,
+                    View::List => Action::TabViewList,
+                }));
+            }
             Message::TabComplete(path, completions) => {
                 if let Some(edit_location) = &mut self.edit_location
                     && edit_location.location.path_opt() == Some(&path)
@@ -5105,11 +5311,19 @@ impl Tab {
             Message::WindowToggleMaximize => {
                 commands.push(Command::WindowToggleMaximize);
             }
+            Message::ToggleDetails => {
+                commands.push(Command::Action(Action::Preview));
+            }
             Message::ZoomIn => {
                 commands.push(Command::Action(Action::ZoomIn));
             }
             Message::ZoomOut => {
                 commands.push(Command::Action(Action::ZoomOut));
+            }
+            Message::ZoomSet(zoom) => {
+                if let Some(zoom) = NonZeroU16::new(zoom) {
+                    commands.push(Command::Action(Action::ZoomSet(zoom)));
+                }
             }
             Message::DirectorySize(path, dir_size) => {
                 let location = Location::Path(path);
@@ -5701,7 +5915,7 @@ impl Tab {
             heading_item(fl!("size"), Length::Fixed(size_width), HeadingOptions::Size),
         ])
         .align_y(Alignment::Center)
-        .height(Length::Fixed((space_m + 4).into()))
+        .height(Length::Fixed((space_m + 16).into()))
         .padding([0, space_xxs]);
 
         let accent_rule =
@@ -5974,6 +6188,7 @@ impl Tab {
 
     pub fn grid_view(
         &self,
+        border_padding: f32,
     ) -> (
         Option<Element<'static, Message>>,
         Element<'_, Message>,
@@ -6219,15 +6434,18 @@ impl Tab {
                 // Cache content height for scroll clamping on next frame
                 self.content_height_opt.set(Some(max_bottom as f32));
 
-                let top_deduct = 7 * (space_xxs as usize);
+                // Until the item view reports the area it is visible in, estimate it from the
+                // pane, less the chrome above the list and the status bar below it.
+                let visible_height = self.item_view_size_opt.get().map_or_else(
+                    || {
+                        let top_deduct = 7 * (space_xxs as usize);
+                        let bar_deduct = self.status_bar_footprint(border_padding) as usize;
+                        height.saturating_sub(top_deduct + bar_deduct)
+                    },
+                    |viewport| viewport.height as usize,
+                );
 
-                self.item_view_size_opt
-                    .set(self.size_opt.get().map(|s| Size {
-                        width: s.width,
-                        height: s.height - top_deduct as f32,
-                    }));
-
-                let spacer_height = height.saturating_sub(max_bottom + top_deduct);
+                let spacer_height = visible_height.saturating_sub(max_bottom);
                 if spacer_height > 0 {
                     column = column.push(widget::container(
                         space::vertical().height(Length::Fixed(spacer_height as f32)),
@@ -6316,6 +6534,7 @@ impl Tab {
 
     pub fn list_view(
         &self,
+        border_padding: f32,
     ) -> (
         Option<Element<'static, Message>>,
         Element<'_, Message>,
@@ -6685,15 +6904,17 @@ impl Tab {
         }
         //TODO: HACK If we don't reach the bottom of the view, go ahead and add a spacer to do that
         {
-            let top_deduct = (if condensed || is_search { 6 } else { 9 }) * space_xxs;
+            // Until the item view reports the area it is visible in, estimate it from the pane,
+            // less the chrome above the list and the status bar below it.
+            let visible_height = self.item_view_size_opt.get().map_or_else(
+                || {
+                    let top_deduct = (if condensed || is_search { 6 } else { 9 }) * space_xxs;
+                    size.height - f32::from(top_deduct) - self.status_bar_footprint(border_padding)
+                },
+                |viewport| viewport.height,
+            );
 
-            self.item_view_size_opt
-                .set(self.size_opt.get().map(|s| Size {
-                    width: s.width,
-                    height: s.height - f32::from(top_deduct),
-                }));
-
-            let spacer_height = size.height - y - f32::from(top_deduct);
+            let spacer_height = visible_height - y;
             if spacer_height > 0. {
                 column = column.push(widget::container(space::vertical().height(spacer_height)));
             }
@@ -6715,6 +6936,173 @@ impl Tab {
         (drag_col, mouse_area.into(), true)
     }
 
+    /// Whether the status bar is shown at the bottom of the pane.
+    fn status_bar_visible(&self) -> bool {
+        self.config.show_status_bar && !matches!(self.mode, Mode::Desktop)
+    }
+
+    /// Space the status bar takes from the bottom of the pane, which the item view excludes when
+    /// deciding how much of the list is visible.
+    fn status_bar_footprint(&self, border_padding: f32) -> f32 {
+        if self.status_bar_visible() {
+            status_bar_height() + border_padding
+        } else {
+            0.0
+        }
+    }
+
+    /// Counts the status bar reports about the contents of the location. They cover the items the
+    /// view shows, which is also the set selecting everything covers, so that the selected count
+    /// matches the total.
+    fn status_bar_counts(&self) -> StatusBarCounts {
+        let mut counts = StatusBarCounts::default();
+        for item in self.items_opt().into_iter().flatten() {
+            if item.hidden && !self.config.show_hidden {
+                continue;
+            }
+            counts.items += 1;
+            if item.selected {
+                counts.selected += 1;
+                if let Some(size) = item.metadata.file_size() {
+                    let total = counts.selected_size.unwrap_or(0);
+                    counts.selected_size = Some(total.saturating_add(size));
+                }
+            }
+        }
+        counts
+    }
+
+    /// Status bar with the number of items in the location, the size of the selection, and the
+    /// zoom and view controls.
+    fn status_bar(&self, size: Size, pane: PaneSettings) -> Element<'_, Message> {
+        let cosmic_theme::Spacing {
+            space_xxs,
+            space_xs,
+            ..
+        } = theme::spacing();
+
+        let mut status = widget::row::with_capacity(8)
+            .align_y(Alignment::Center)
+            .spacing(space_xxs);
+
+        // The counts fill the space the controls leave, so that a long selection clips instead of
+        // pushing the controls out of the bar. They are left out entirely when the pane is too
+        // narrow for the controls to share the bar with them.
+        if size.width >= min_status_bar_text_width() {
+            let counts = self.status_bar_counts();
+
+            let mut text_row = widget::row::with_capacity(4)
+                .align_y(Alignment::Center)
+                .spacing(space_xxs)
+                .push(
+                    widget::text::caption(fl!("status-bar-items", items = counts.items))
+                        .wrapping(text::Wrapping::None),
+                );
+
+            if counts.selected > 0 {
+                text_row = text_row
+                    .push(widget::divider::vertical::default().height(Length::Fixed(16.0)))
+                    .push(
+                        widget::text::caption(fl!(
+                            "status-bar-items-selected",
+                            items = counts.selected
+                        ))
+                        .wrapping(text::Wrapping::None),
+                    );
+
+                if let Some(size) = counts.selected_size {
+                    text_row = text_row.push(
+                        widget::text::caption(fl!(
+                            "status-bar-selection-size",
+                            size = format_size(size)
+                        ))
+                        .wrapping(text::Wrapping::None),
+                    );
+                }
+            }
+
+            status = status.push(widget::container(text_row).width(Length::Fill).clip(true));
+        } else {
+            status = status.push(widget::space::horizontal());
+        }
+
+        let zoom = match self.config.view {
+            View::Grid => self.config.icon_sizes.grid,
+            View::List => self.config.icon_sizes.list,
+        };
+
+        status = status.push(status_bar_button(
+            widget::icon::from_name("zoom-out-symbolic"),
+            fl!("zoom-out"),
+            Message::ZoomOut,
+            false,
+        ));
+
+        // The slider is dropped before the buttons when the pane is too narrow for all of them.
+        if size.width >= status_bar_controls_width(true) {
+            status = status.push(widget::tooltip(
+                widget::slider(
+                    MIN_ZOOM.get()..=MAX_ZOOM.get(),
+                    zoom.get(),
+                    Message::ZoomSet,
+                )
+                .step(ZOOM_STEP)
+                .width(Length::Fixed(STATUS_BAR_ZOOM_SLIDER_WIDTH))
+                // Sized to the buttons so that the bar keeps the height it reports.
+                .height(status_bar_controls_height())
+                .handle_width(STATUS_BAR_ZOOM_HANDLE_SIZE)
+                .handle_height(STATUS_BAR_ZOOM_HANDLE_SIZE),
+                widget::text::caption(format!("{zoom}%")),
+                widget::tooltip::Position::Top,
+            ));
+        }
+
+        status = status
+            .push(status_bar_button(
+                widget::icon::from_name("zoom-in-symbolic"),
+                fl!("zoom-in"),
+                Message::ZoomIn,
+                false,
+            ))
+            .push(widget::space::horizontal().width(Length::Fixed(f32::from(space_xs))))
+            .push(status_bar_button(
+                widget::icon::from_name("view-list-symbolic"),
+                fl!("list-view"),
+                Message::SetView(View::List),
+                matches!(self.config.view, View::List),
+            ))
+            .push(status_bar_button(
+                widget::icon::from_name("view-grid-symbolic"),
+                fl!("grid-view"),
+                Message::SetView(View::Grid),
+                matches!(self.config.view, View::Grid),
+            ))
+            .push(widget::space::horizontal().width(Length::Fixed(f32::from(space_xs))))
+            .push(status_bar_button(
+                widget::icon::from_name(if pane.show_details {
+                    "navbar-open-symbolic"
+                } else {
+                    "navbar-closed-symbolic"
+                }),
+                fl!("show-details"),
+                Message::ToggleDetails,
+                pane.show_details,
+            ));
+
+        // The gap keeps the bar off the bottom edge of the window, like the details pane beside it.
+        widget::container(
+            widget::layer_container(status)
+                .padding([space_xxs, space_xs])
+                .layer(cosmic_theme::Layer::Primary)
+                .height(Length::Fixed(status_bar_height())),
+        )
+        .padding(Padding {
+            bottom: pane.border_padding,
+            ..Padding::ZERO
+        })
+        .into()
+    }
+
     pub fn view_responsive<'a>(
         &'a self,
         key_binds: &'a HashMap<KeyBind, Action>,
@@ -6722,6 +7110,7 @@ impl Tab {
         size: Size,
         clipboard_paste_available: bool,
         context_actions: &'a [ContextActionPreset],
+        pane: PaneSettings,
     ) -> Element<'a, Message> {
         // Update cached size
         self.size_opt.set(Some(size));
@@ -6739,8 +7128,8 @@ impl Tab {
             Some(self.location_view())
         };
         let (drag_list, mut item_view, can_scroll) = match self.config.view {
-            View::Grid => self.grid_view(),
-            View::List => self.list_view(),
+            View::Grid => self.grid_view(pane.border_padding),
+            View::List => self.list_view(pane.border_padding),
         };
         item_view = widget::container(item_view).width(Length::Fill).into();
         let files = self
@@ -6793,13 +7182,15 @@ impl Tab {
         let mouse_area = mouse_area::MouseArea::new(item_view)
             .on_press(move |_point_opt| Message::Click(None))
             .on_release(|_| Message::ClickRelease(None))
-            .on_resize(Message::Resize)
             .on_back_press(move |_point_opt| Message::GoPrevious)
             .on_forward_press(move |_point_opt| Message::GoNext)
             .on_scroll(|delta| respond_to_scroll_direction(delta, modifiers))
             .on_right_press(|_| Message::RightClickBackground);
 
         let items_area: Element<'_, Message> = if can_scroll {
+            // Only the content of a scrollable is told the visible area of the list, which is what
+            // the scroll math needs, so the resize is only reported from inside one.
+            let mouse_area = mouse_area.on_resize(Message::Resize);
             // FIXME: new responsive widget will remove the state from the scrollable
             // id_container with custom id forces the state to be extracted in a diff
             // pre-processing step
@@ -6828,6 +7219,8 @@ impl Tab {
             )),
         )
         .item_width(cosmic::widget::menu::ItemWidth::Uniform(360))
+        .on_open(Message::FileContextMenuOpened)
+        .on_close(Message::FileContextMenuClosed)
         .on_surface_action(Message::Surface);
         if let Some(window_id) = self.window_id {
             context_menu = context_menu.window_id(window_id);
@@ -6890,6 +7283,9 @@ impl Tab {
                 );
             }
             _ => {}
+        }
+        if self.status_bar_visible() {
+            tab_column = tab_column.push(self.status_bar(size, pane));
         }
         let mut tab_view = widget::container(tab_column)
             .height(Length::Fill)
@@ -7200,6 +7596,7 @@ impl Tab {
         modifiers: &'a Modifiers,
         clipboard_paste_available: bool,
         context_actions: &'a [ContextActionPreset],
+        pane: PaneSettings,
     ) -> Element<'a, Message> {
         widget::responsive(move |size| {
             widget::id_container(
@@ -7209,6 +7606,7 @@ impl Tab {
                     size,
                     clipboard_paste_available,
                     context_actions,
+                    pane,
                 ),
                 Id::new(format!(
                     "tab-{}-{}",
@@ -7772,6 +8170,82 @@ pub fn respond_to_scroll_direction(delta: ScrollDelta, modifiers: &Modifiers) ->
     None
 }
 
+/// Compact icon button with a tooltip, for the status bar. The selected state is only rendered by
+/// [`status_bar_toggle_class`], since the icon button style ignores it.
+///
+/// The buttons are sized with [`widget::button::icon`]'s extra small preset, which pins the icon
+/// size [`status_bar_height`] relies on.
+fn status_bar_button<'a>(
+    icon: impl Into<widget::icon::Handle>,
+    label: String,
+    message: Message,
+    selected: bool,
+) -> Element<'a, Message> {
+    widget::tooltip(
+        widget::button::icon(icon)
+            .extra_small()
+            .on_press(message)
+            .selected(selected)
+            .class(status_bar_toggle_class(selected)),
+        widget::text::body(label),
+        widget::tooltip::Position::Top,
+    )
+    .into()
+}
+
+/// Class for a status bar toggle button, which adds the selected state that the icon button style
+/// does not draw.
+fn status_bar_toggle_class(selected: bool) -> theme::Button {
+    theme::Button::Custom {
+        active: Box::new(move |focused, theme| {
+            status_bar_toggle_style(
+                widget::button::Catalog::active(theme, focused, selected, &theme::Button::Icon),
+                selected,
+                theme,
+            )
+        }),
+        disabled: Box::new(move |theme| {
+            status_bar_toggle_style(
+                widget::button::Catalog::disabled(theme, &theme::Button::Icon),
+                selected,
+                theme,
+            )
+        }),
+        hovered: Box::new(move |focused, theme| {
+            status_bar_toggle_style(
+                widget::button::Catalog::hovered(theme, focused, selected, &theme::Button::Icon),
+                selected,
+                theme,
+            )
+        }),
+        pressed: Box::new(move |focused, theme| {
+            status_bar_toggle_style(
+                widget::button::Catalog::pressed(theme, focused, selected, &theme::Button::Icon),
+                selected,
+                theme,
+            )
+        }),
+    }
+}
+
+fn status_bar_toggle_style(
+    mut style: widget::button::Style,
+    selected: bool,
+    theme: &cosmic::Theme,
+) -> widget::button::Style {
+    if selected {
+        let cosmic = theme.cosmic();
+        let on_accent = cosmic.accent_text_color().into();
+        style.background = Some(Background::Color(
+            cosmic.icon_button.selected_state_color().into(),
+        ));
+        style.icon_color = Some(on_accent);
+        style.text_color = Some(on_accent);
+    }
+
+    style
+}
+
 fn text_editor_class(
     theme: &cosmic::Theme,
     status: cosmic::widget::text_editor::Status,
@@ -7834,13 +8308,243 @@ mod tests {
     use test_log::test;
 
     use super::{
-        ItemMetadata, ItemThumbnail, Location, Message, Tab, respond_to_scroll_direction, scan_path,
+        Command, ItemMetadata, ItemThumbnail, Location, Message, StatusBarCounts, Tab, View,
+        respond_to_scroll_direction, scan_path, status_bar_toggle_style,
     };
+    use crate::app::Action;
     use crate::app::test_utils::{
         NAME_LEN, NUM_DIRS, NUM_FILES, NUM_HIDDEN, NUM_NESTED, assert_eq_tab_path, empty_fs,
         eq_path_item, filter_dirs, read_dir_sorted, simple_fs, tab_click_new,
     };
     use crate::config::{IconSizes, TabConfig, ThumbCfg};
+    use crate::fl;
+
+    fn empty_tab() -> io::Result<(TempDir, Tab)> {
+        let fs = empty_fs()?;
+        let tab = Tab::new(
+            Location::Path(fs.path().into()),
+            TabConfig::default(),
+            ThumbCfg::default(),
+            None,
+            widget::Id::unique(),
+            None,
+        );
+        Ok((fs, tab))
+    }
+
+    #[test]
+    fn status_bar_toggle_shows_the_selected_state() {
+        let t = cosmic::Theme::dark();
+        let style = |selected: bool| {
+            status_bar_toggle_style(
+                widget::button::Catalog::active(&t, false, selected, &cosmic::theme::Button::Icon),
+                selected,
+                &t,
+            )
+        };
+
+        let selected = style(true);
+        let unselected = style(false);
+
+        assert_ne!(
+            selected.background, unselected.background,
+            "the selected view button should be distinguishable from the other"
+        );
+        assert_ne!(selected.icon_color, unselected.icon_color);
+    }
+
+    #[test]
+    fn status_bar_messages_are_localized() {
+        // Fluent wraps placeables in isolation marks, which are not visible
+        fn strip(text: String) -> String {
+            text.replace(['\u{2068}', '\u{2069}'], "")
+        }
+
+        assert_eq!(strip(fl!("status-bar-items", items = 1)), "1 item");
+        assert_eq!(strip(fl!("status-bar-items", items = 3)), "3 items");
+        assert_eq!(strip(fl!("status-bar-items", items = 0)), "0 items");
+        assert_eq!(
+            strip(fl!("status-bar-items-selected", items = 1)),
+            "1 item selected"
+        );
+        assert_eq!(
+            strip(fl!("status-bar-items-selected", items = 2)),
+            "2 items selected"
+        );
+        assert_eq!(
+            strip(fl!("status-bar-selection-size", size = "30.3 KB")),
+            "(30.3 KB)"
+        );
+    }
+
+    #[test]
+    fn tab_zoom_set_emits_zoom_action() -> io::Result<()> {
+        let (_fs, mut tab) = empty_tab()?;
+
+        let commands = tab.update(Message::ZoomSet(150), Modifiers::empty());
+        assert!(
+            commands.iter().any(|command| matches!(
+                command,
+                Command::Action(Action::ZoomSet(zoom)) if zoom.get() == 150
+            )),
+            "expected a zoom action, got {commands:?}"
+        );
+
+        // A zoom of zero cannot be stored in the config
+        let commands = tab.update(Message::ZoomSet(0), Modifiers::empty());
+        assert!(
+            !commands
+                .iter()
+                .any(|command| matches!(command, Command::Action(Action::ZoomSet(_)))),
+            "unexpected zoom action, got {commands:?}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn tab_set_view_emits_view_action() -> io::Result<()> {
+        let (_fs, mut tab) = empty_tab()?;
+
+        let commands = tab.update(Message::SetView(View::Grid), Modifiers::empty());
+        assert!(
+            commands
+                .iter()
+                .any(|command| matches!(command, Command::Action(Action::TabViewGrid))),
+            "expected the grid view action, got {commands:?}"
+        );
+
+        let commands = tab.update(Message::SetView(View::List), Modifiers::empty());
+        assert!(
+            commands
+                .iter()
+                .any(|command| matches!(command, Command::Action(Action::TabViewList))),
+            "expected the list view action, got {commands:?}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn tab_toggle_details_emits_preview_action() -> io::Result<()> {
+        let (_fs, mut tab) = empty_tab()?;
+
+        let commands = tab.update(Message::ToggleDetails, Modifiers::empty());
+        assert!(
+            commands
+                .iter()
+                .any(|command| matches!(command, Command::Action(Action::Preview))),
+            "expected the preview action, got {commands:?}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn status_bar_footprint_follows_the_config() -> io::Result<()> {
+        let (_fs, mut tab) = empty_tab()?;
+        assert!(tab.status_bar_visible());
+        assert_eq!(
+            tab.status_bar_footprint(8.0),
+            super::status_bar_height() + 8.0
+        );
+
+        tab.config.show_status_bar = false;
+        assert!(!tab.status_bar_visible());
+        assert_eq!(tab.status_bar_footprint(8.0), 0.0);
+
+        Ok(())
+    }
+
+    /// Selecting everything must leave the selected count equal to the total, which means both have
+    /// to cover the items the view shows.
+    #[test]
+    fn status_bar_counts_cover_the_items_the_view_shows() -> io::Result<()> {
+        let fs = empty_fs()?;
+        fs::write(fs.path().join("file"), b"data")?;
+        fs::write(fs.path().join(".hidden"), b"data")?;
+
+        let mut tab = Tab::new(
+            Location::Path(fs.path().into()),
+            TabConfig::default(),
+            ThumbCfg::default(),
+            None,
+            widget::Id::unique(),
+            None,
+        );
+        tab.set_items(scan_path(&fs.path().to_owned(), IconSizes::default()));
+
+        // The hidden file is not shown, so it is not counted and selecting everything skips it.
+        assert_eq!(
+            tab.status_bar_counts(),
+            StatusBarCounts {
+                items: 1,
+                selected: 0,
+                selected_size: None,
+            }
+        );
+
+        tab.select_all();
+        assert_eq!(
+            tab.status_bar_counts(),
+            StatusBarCounts {
+                items: 1,
+                selected: 1,
+                selected_size: Some(4),
+            }
+        );
+
+        // Showing the hidden files brings them into both counts.
+        tab.config.show_hidden = true;
+        tab.select_all();
+        assert_eq!(
+            tab.status_bar_counts(),
+            StatusBarCounts {
+                items: 2,
+                selected: 2,
+                selected_size: Some(8),
+            }
+        );
+
+        Ok(())
+    }
+
+    /// Items scrolled into view must not end up underneath the status bar.
+    #[test]
+    fn item_view_uses_the_reported_viewport() -> io::Result<()> {
+        let (_fs, mut tab) = tab_click_new(NUM_FILES, NUM_HIDDEN, NUM_DIRS, NUM_NESTED, NAME_LEN)?;
+
+        // The item view reports the area it is visible in, which is the list without the chrome
+        // above it or the status bar below it. Only the first row of it is visible here.
+        let row_height = 30.0;
+        let viewport = Size::new(600.0, row_height);
+        let _ = tab.update(
+            Message::Resize(Rectangle::new(Point::new(0.0, 0.0), viewport)),
+            Modifiers::empty(),
+        );
+        assert_eq!(tab.item_view_size_opt.get(), Some(viewport));
+
+        // Focusing the last item scrolls it into that area, not past it
+        let items = tab.items_opt().expect("tab is populated with items");
+        for (i, item) in items.iter().enumerate() {
+            item.rect_opt.set(Some(Rectangle::new(
+                Point::new(0.0, i as f32 * row_height),
+                Size::new(viewport.width, row_height),
+            )));
+        }
+        let last = items.len() - 1;
+        tab.select_focus = Some(last);
+        let offset = tab
+            .select_focus_scroll()
+            .expect("the last item is below the viewport");
+
+        // The item comes to rest flush with the bottom of the area it was told it is visible in,
+        // which is what keeps it from ending up under the status bar.
+        let bottom = (last + 1) as f32 * row_height;
+        assert_eq!(offset.y, bottom - viewport.height);
+
+        Ok(())
+    }
 
     // Boilerplate for tab tests. Checks if simulated clicks selected items.
     fn tab_selects_item(
