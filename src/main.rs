@@ -6,6 +6,7 @@ use tikv_jemallocator::Jemalloc;
 static GLOBAL: Jemalloc = Jemalloc;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(feature = "jxl")]
     let _ = jxl_oxide::integration::register_image_decoding_hook();
     cosmic_files::main()
 }

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use cosmic::widget::icon;
-use mime_guess::Mime;
+use mime::{self, Mime};
 use rustc_hash::FxHashMap;
 use std::fs;
 use std::path::Path;
@@ -59,7 +59,7 @@ pub fn mime_for_path(
     metadata_opt: Option<&fs::Metadata>,
     remote: bool,
 ) -> Mime {
-    mime_guess::from_path(path).first_or_octet_stream()
+    mime_from_extension(path).unwrap_or(mime::APPLICATION_OCTET_STREAM)
 }
 
 #[cfg(unix)]
@@ -93,14 +93,79 @@ pub fn mime_for_path(
     }
 
     // `xdg-mime-rs` sets the guess to uncertain if it returns special mime types.
-    // The guess could also be uncertain on platforms without shared-mime-info.
-    // Try mime_guess, but only if it is not one of the special mime types.
+    // The guess can be uncertain if shared-mime-info has no matching rule. Keep special file
+    // types from falling through to the extension table.
     if guess.uncertain() && (remote || !is_special_mime(guessed_mime)) {
-        // If uncertain, try mime_guess. This could happen on platforms without shared-mime-info
-        mime_guess::from_path(path).first_or_octet_stream()
+        // The local table covers common formats when no shared-mime-info rule is available.
+        mime_from_extension(path).unwrap_or(mime::APPLICATION_OCTET_STREAM)
     } else {
         guessed_mime.clone()
     }
+}
+
+#[cfg(unix)]
+pub(crate) fn mime_from_extension(path: impl AsRef<Path>) -> Option<Mime> {
+    let Some(extension) = path.as_ref().extension().and_then(std::ffi::OsStr::to_str) else {
+        return None;
+    };
+
+    let essence = match extension.to_ascii_lowercase().as_str() {
+        "txt" | "md" | "markdown" | "log" => "text/plain",
+        "csv" => "text/csv",
+        "tsv" => "text/tab-separated-values",
+        "html" | "htm" => "text/html",
+        "css" => "text/css",
+        "js" | "mjs" => "text/javascript",
+        "ts" => "text/typescript",
+        "json" => "application/json",
+        "xml" => "application/xml",
+        "yaml" | "yml" => "application/yaml",
+        "toml" => "application/toml",
+        "pdf" => "application/pdf",
+        "desktop" => "application/x-desktop",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "svg" => "image/svg+xml",
+        "ico" => "image/vnd.microsoft.icon",
+        "tif" | "tiff" => "image/tiff",
+        "avif" => "image/avif",
+        "mp3" => "audio/mpeg",
+        "ogg" | "oga" => "audio/ogg",
+        "opus" => "audio/opus",
+        "flac" => "audio/flac",
+        "wav" => "audio/wav",
+        "m4a" => "audio/mp4",
+        "aac" => "audio/aac",
+        "mp4" | "m4v" => "video/mp4",
+        "mov" => "video/quicktime",
+        "mkv" => "video/x-matroska",
+        "webm" => "video/webm",
+        "avi" => "video/x-msvideo",
+        "zip" => "application/zip",
+        "gz" | "tgz" => "application/gzip",
+        "tar" => "application/x-tar",
+        "bz" | "bz2" => "application/x-bzip2",
+        "xz" => "application/x-xz",
+        "zst" => "application/zstd",
+        "7z" => "application/x-7z-compressed",
+        "rar" => "application/vnd.rar",
+        "doc" => "application/msword",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xls" => "application/vnd.ms-excel",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "ppt" => "application/vnd.ms-powerpoint",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        _ => return None,
+    };
+    essence.parse().ok()
+}
+
+#[cfg(not(unix))]
+pub(crate) fn mime_from_extension(path: impl AsRef<Path>) -> Option<Mime> {
+    mime_guess::from_path(path).first()
 }
 
 pub fn mime_icon(mime: Mime, size: u16) -> icon::Handle {
@@ -131,4 +196,18 @@ pub fn is_mime_subclass_of(mime_type: &Mime, base: &Mime) -> bool {
     mime_icon_cache
         .shared_mime_info
         .mime_type_subclass(mime_type, base)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::mime_from_extension;
+
+    #[test]
+    fn fallback_maps_common_extensions_case_insensitively() {
+        assert_eq!(
+            mime_from_extension("photo.JpEg").unwrap().essence_str(),
+            "image/jpeg"
+        );
+        assert!(mime_from_extension("unknown.custom").is_none());
+    }
 }

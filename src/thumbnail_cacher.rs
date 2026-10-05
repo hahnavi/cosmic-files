@@ -357,7 +357,7 @@ fn thumbnail_uri_lossy(path: &Path) -> Option<String> {
 
 fn thumbnail_cache_filename(file_uri: &str) -> String {
     let hash = Md5::digest(file_uri);
-    format!("{hash:x}.png")
+    format!("{}.png", hex::encode(hash))
 }
 
 fn fail_marker_path(cache_base_dir: &Path, cache_filename: &str) -> PathBuf {
@@ -966,7 +966,7 @@ mod tests {
     #[test]
     fn item_thumbnail_cache_lookup_never_generates() {
         use crate::tab::ItemThumbnail;
-        use mime_guess::Mime;
+        use mime::Mime;
 
         let root = TempDir::new().unwrap();
         let cache_base = root.path().join("cache");

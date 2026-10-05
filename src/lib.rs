@@ -13,7 +13,12 @@ use crate::config::{Config, State};
 use crate::tab::Location;
 
 pub mod app;
+#[cfg(feature = "archives")]
 mod archive;
+#[cfg(not(feature = "archives"))]
+mod archive {
+    pub const SUPPORTED_ARCHIVE_TYPES: &[&str] = &[];
+}
 pub mod channel;
 pub mod clipboard;
 pub mod config;
@@ -29,6 +34,7 @@ pub mod mime_icon;
 mod mounter;
 mod mouse_area;
 pub mod operation;
+mod recently_used;
 mod spawn_detached;
 pub mod tab;
 mod thumbnail_cacher;

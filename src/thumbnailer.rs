@@ -3,7 +3,7 @@
 
 #[cfg(feature = "desktop")]
 use cosmic::desktop::fde::GenericEntry;
-use mime_guess::Mime;
+use mime::Mime;
 use rustc_hash::FxHashMap;
 use std::path::Path;
 use std::sync::{LazyLock, Mutex};

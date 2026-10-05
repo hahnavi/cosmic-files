@@ -1,18 +1,23 @@
 use crate::app::{ArchiveType, DialogPage, Message, REPLACE_BUTTON_ID};
+#[cfg(feature = "archives")]
+use crate::archive;
 use crate::config::IconSizes;
 use crate::spawn_detached::spawn_detached;
 use crate::thumbnail_cacher::{self, ThumbnailRelocation};
-use crate::{archive, fl, tab};
+use crate::{fl, tab};
 use cosmic::iced::futures::channel::mpsc::Sender;
 use cosmic::iced::futures::{self, SinkExt, StreamExt, stream};
 use std::borrow::Cow;
 use std::fmt::Formatter;
 use std::fs;
+#[cfg(feature = "archives")]
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{Mutex as TokioMutex, mpsc};
+#[cfg(feature = "archives")]
 use walkdir::WalkDir;
+#[cfg(feature = "archives")]
 use zip::AesMode::Aes256;
 
 pub use self::controller::{Controller, ControllerState};
@@ -69,6 +74,7 @@ async fn handle_replace(
     rx.recv().await.unwrap_or(ReplaceResult::Cancel)
 }
 
+#[cfg(feature = "archives")]
 fn get_directory_name(file_name: &str) -> &str {
     // TODO: Chain with COMPOUND_EXTENSIONS once more formats are supported
     for ext in crate::archive::SUPPORTED_EXTENSIONS {
@@ -681,6 +687,7 @@ impl Operation {
 
         //TODO: IF ERROR, RETURN AN Operation THAT CAN UNDO THE CURRENT STATE
         let paths: Result<OperationSelection, OperationError> = match self {
+            #[cfg(feature = "archives")]
             Self::Compress {
                 paths,
                 to,
@@ -866,6 +873,74 @@ impl Operation {
                 .await
                 .map_err(wrap_compio_spawn_error)?
             }
+            #[cfg(feature = "archives")]
+            Self::Extract {
+                paths,
+                to,
+                password,
+            } => {
+                let controller_clone = controller.clone();
+                compio::runtime::spawn(async move {
+                    let extracted = compio::runtime::spawn_blocking(move || {
+                        let controller = controller_clone;
+                        let total_paths = paths.len();
+                        let mut op_sel = OperationSelection::default();
+                        let mut written_files = Vec::new();
+                        let mut target_dirs = std::collections::HashSet::new();
+                        for (i, path) in paths.iter().enumerate() {
+                            futures::executor::block_on(async {
+                                controller
+                                    .check()
+                                    .await
+                                    .map_err(|s| OperationError::from_state(s, &controller))
+                            })?;
+
+                            controller.set_progress((i as f32) / total_paths as f32);
+
+                            if let Some(file_name) = path.file_name().and_then(|f| f.to_str()) {
+                                let dir_name = get_directory_name(file_name);
+                                let mut new_dir = to.join(dir_name);
+
+                                if new_dir.exists()
+                                    && let Some(new_dir_parent) = new_dir.parent()
+                                {
+                                    new_dir = copy_unique_path(&new_dir, new_dir_parent);
+                                }
+
+                                op_sel.ignored.push(path.clone());
+                                op_sel.selected.push(new_dir.clone());
+
+                                let (files, dirs) = crate::archive::extract(
+                                    path,
+                                    &new_dir,
+                                    &password,
+                                    &controller,
+                                )?;
+                                written_files.extend(files);
+                                target_dirs.extend(dirs);
+                            }
+                        }
+
+                        Ok::<_, OperationError>((op_sel, written_files, target_dirs))
+                    })
+                    .await
+                    .map_err(wrap_compio_spawn_error)??;
+
+                    let (op_sel, written_files, target_dirs) = extracted;
+                    if !written_files.is_empty() || !target_dirs.is_empty() {
+                        sync_to_disk(written_files, target_dirs).await;
+                    }
+
+                    Ok::<_, OperationError>(op_sel)
+                })
+                .await
+                .map_err(wrap_compio_spawn_error)?
+            }
+            #[cfg(not(feature = "archives"))]
+            Self::Compress { .. } | Self::Extract { .. } => Err(OperationError::from_err(
+                "archive support is disabled",
+                &controller,
+            )),
             Self::Copy { paths, to } => {
                 copy_or_move(paths, to, Method::Copy, msg_tx, controller).await
             }
@@ -997,68 +1072,6 @@ impl Operation {
                 }
                 Ok(OperationSelection::default())
             }
-            Self::Extract {
-                paths,
-                to,
-                password,
-            } => {
-                let controller_clone = controller.clone();
-                compio::runtime::spawn(async move {
-                    let extracted = compio::runtime::spawn_blocking(move || {
-                        let controller = controller_clone;
-                        let total_paths = paths.len();
-                        let mut op_sel = OperationSelection::default();
-                        let mut written_files = Vec::new();
-                        let mut target_dirs = std::collections::HashSet::new();
-                        for (i, path) in paths.iter().enumerate() {
-                            futures::executor::block_on(async {
-                                controller
-                                    .check()
-                                    .await
-                                    .map_err(|s| OperationError::from_state(s, &controller))
-                            })?;
-
-                            controller.set_progress((i as f32) / total_paths as f32);
-
-                            if let Some(file_name) = path.file_name().and_then(|f| f.to_str()) {
-                                let dir_name = get_directory_name(file_name);
-                                let mut new_dir = to.join(dir_name);
-
-                                if new_dir.exists()
-                                    && let Some(new_dir_parent) = new_dir.parent()
-                                {
-                                    new_dir = copy_unique_path(&new_dir, new_dir_parent);
-                                }
-
-                                op_sel.ignored.push(path.clone());
-                                op_sel.selected.push(new_dir.clone());
-
-                                let (files, dirs) = crate::archive::extract(
-                                    path,
-                                    &new_dir,
-                                    &password,
-                                    &controller,
-                                )?;
-                                written_files.extend(files);
-                                target_dirs.extend(dirs);
-                            }
-                        }
-
-                        Ok::<_, OperationError>((op_sel, written_files, target_dirs))
-                    })
-                    .await
-                    .map_err(wrap_compio_spawn_error)??;
-
-                    let (op_sel, written_files, target_dirs) = extracted;
-                    if !written_files.is_empty() || !target_dirs.is_empty() {
-                        sync_to_disk(written_files, target_dirs).await;
-                    }
-
-                    Ok::<_, OperationError>(op_sel)
-                })
-                .await
-                .map_err(wrap_compio_spawn_error)?
-            }
             Self::Move {
                 paths,
                 to,
@@ -1144,7 +1157,7 @@ impl Operation {
             Self::RemoveFromRecents { paths } => {
                 tokio::task::spawn_blocking(move || {
                     let path_refs = paths.iter().map(PathBuf::as_path).collect::<Box<[_]>>();
-                    recently_used_xbel::remove_recently_used(&path_refs)
+                    crate::recently_used::remove_recently_used(&path_refs)
                 })
                 .await
                 .map_err(|e| OperationError::from_err(e, &controller))?
@@ -1305,14 +1318,16 @@ impl Operation {
 }
 
 #[track_caller]
-fn wrap_compio_spawn_error(err: Box<dyn std::any::Any + Send>) -> OperationError {
+fn wrap_compio_spawn_error(err: compio::runtime::JoinError) -> OperationError {
     log::error!(
         "compio runtime spawn failed: {}",
         std::backtrace::Backtrace::capture()
     );
 
     // Preserve error if it's already an OperationError
-    if let Ok(err) = err.downcast() {
+    if let compio::runtime::JoinError::Panicked(err) = err
+        && let Ok(err) = err.downcast()
+    {
         *err
     } else {
         OperationError::from_msg("compio runtime spawn failed")

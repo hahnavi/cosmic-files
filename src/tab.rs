@@ -19,13 +19,8 @@ use cosmic::widget::menu::key_bind::KeyBind;
 use cosmic::widget::{self, DndDestination, DndSource, Id, RcElementWrapper, Widget, space};
 use cosmic::{Apply, Element, cosmic_theme, font, theme};
 use i18n_embed::LanguageLoader;
-use icu::datetime::input::DateTime;
-use icu::datetime::options::TimePrecision;
-use icu::datetime::{DateTimeFormatter, DateTimeFormatterPreferences, fieldsets};
-use icu::locale::preferences::extensions::unicode::keywords::HourCycle;
 use image::ImageReader;
-use jiff_icu::ConvertFrom;
-use mime_guess::{Mime, mime};
+use mime::{self, Mime};
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -60,7 +55,7 @@ use crate::large_image::{
     LargeImageManager, decode_large_image, exceeds_memory_limit, should_use_dedicated_worker,
     should_use_tiling,
 };
-use crate::localize::{LANGUAGE_SORTER, LOCALE};
+use crate::localize::{DateTimeFormatter, LANGUAGE_SORTER};
 use crate::mime_icon::{mime_for_path, mime_icon};
 use crate::mounter::MOUNTERS;
 use crate::operation::{Controller, OperationError};
@@ -475,45 +470,25 @@ fn set_mode_part(mode: u32, shift: u32, bits: u32) -> u32 {
     (mode & !(0o7 << shift)) | (bits << shift)
 }
 
-fn date_time_formatter(military_time: bool) -> DateTimeFormatter<fieldsets::YMDT> {
-    let mut prefs = DateTimeFormatterPreferences::from(LOCALE.clone());
-    prefs.hour_cycle = Some(if military_time {
-        HourCycle::H23
-    } else {
-        HourCycle::H12
-    });
-
-    let mut fs = fieldsets::YMDT::medium();
-    fs = fs.with_time_precision(TimePrecision::Minute);
-
-    DateTimeFormatter::try_new(prefs, fs).expect("failed to create DateTimeFormatter")
+fn date_time_formatter(military_time: bool) -> DateTimeFormatter {
+    DateTimeFormatter::new(military_time, true)
 }
 
-fn time_formatter(military_time: bool) -> DateTimeFormatter<fieldsets::T> {
-    let mut prefs = DateTimeFormatterPreferences::from(LOCALE.clone());
-    prefs.hour_cycle = Some(if military_time {
-        HourCycle::H23
-    } else {
-        HourCycle::H12
-    });
-
-    let mut fs = fieldsets::T::medium();
-    fs = fs.with_time_precision(TimePrecision::Minute);
-
-    DateTimeFormatter::try_new(prefs, fs).expect("failed to create DateTimeFormatter")
+fn time_formatter(military_time: bool) -> DateTimeFormatter {
+    DateTimeFormatter::new(military_time, false)
 }
 
 struct FormatTime<'a> {
     pub time: SystemTime,
-    pub date_time_formatter: &'a DateTimeFormatter<fieldsets::YMDT>,
-    pub time_formatter: &'a DateTimeFormatter<fieldsets::T>,
+    pub date_time_formatter: &'a DateTimeFormatter,
+    pub time_formatter: &'a DateTimeFormatter,
 }
 
 impl<'a> FormatTime<'a> {
     fn from_secs(
         secs: i64,
-        date_time_formatter: &'a DateTimeFormatter<fieldsets::YMDT>,
-        time_formatter: &'a DateTimeFormatter<fieldsets::T>,
+        date_time_formatter: &'a DateTimeFormatter,
+        time_formatter: &'a DateTimeFormatter,
     ) -> Option<Self> {
         // This looks convoluted because we need to ensure the units match up
         let secs: u64 = secs.try_into().ok()?;
@@ -538,21 +513,20 @@ impl Display for FormatTime<'_> {
             return Ok(());
         };
         let now = jiff::Zoned::now();
-        let icu_datetime = DateTime::convert_from(zoned.datetime());
         if zoned.date() == now.date() {
             f.write_str(fl!("today").as_str())?;
             f.write_str(", ")?;
-            self.time_formatter.format(&icu_datetime).fmt(f)
+            f.write_str(&self.time_formatter.format(self.time))
         } else {
-            self.date_time_formatter.format(&icu_datetime).fmt(f)
+            f.write_str(&self.date_time_formatter.format(self.time))
         }
     }
 }
 
 const fn format_time<'a>(
     time: SystemTime,
-    date_time_formatter: &'a DateTimeFormatter<fieldsets::YMDT>,
-    time_formatter: &'a DateTimeFormatter<fieldsets::T>,
+    date_time_formatter: &'a DateTimeFormatter,
+    time_formatter: &'a DateTimeFormatter,
 ) -> FormatTime<'a> {
     FormatTime {
         time,
@@ -1301,7 +1275,7 @@ pub fn scan_search<F: Fn(SearchItem) -> bool + Sync>(
                 });
         }
         SearchLocation::Recents => {
-            let recent_files = match recently_used_xbel::parse_file() {
+            let recent_files = match crate::recently_used::parse_file() {
                 Ok(recent_files) => recent_files,
                 Err(err) => {
                     log::warn!("Error reading recent files: {err:?}");
@@ -1359,14 +1333,14 @@ fn uri_to_path(uri: String) -> Option<PathBuf> {
 }
 
 pub fn has_recents() -> bool {
-    match recently_used_xbel::parse_file() {
+    match crate::recently_used::parse_file() {
         Ok(recent_files) => !recent_files.bookmarks.is_empty(),
         Err(_) => false,
     }
 }
 
 pub fn scan_recents(sizes: IconSizes) -> Vec<Item> {
-    let recent_files = match recently_used_xbel::parse_file() {
+    let recent_files = match crate::recently_used::parse_file() {
         Ok(recent_files) => recent_files,
         Err(err) => {
             log::warn!("Error reading recent files: {err:?}");
@@ -1518,6 +1492,16 @@ pub fn scan_desktop(
     }
 
     items
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InlineRename {
+    pub index: usize,
+    pub path: PathBuf,
+    pub name: String,
+    pub original_name: String,
+    pub id: widget::Id,
+    pub is_dir: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1860,6 +1844,8 @@ pub enum Command {
     SetPermissions(PathBuf, u32),
     SetMultiplePermissions(Vec<(PathBuf, u32)>),
     SetSort(String, HeadingOptions, bool),
+    Rename(PathBuf, PathBuf),
+    Toast(String),
     WindowDrag,
     WindowToggleMaximize,
 }
@@ -1907,6 +1893,11 @@ pub enum Message {
     LocationUp,
     Open(Option<PathBuf>),
     Reload,
+    RenameStart(Option<usize>),
+    RenameInput(String),
+    RenameSubmit(Option<String>),
+    RenameNext,
+    RenameCancel,
     RightClick(Option<Point>, Option<usize>),
     MiddleClick(usize),
     Resize(Rectangle),
@@ -3065,6 +3056,7 @@ pub struct Tab {
     pub item_view_size_opt: Cell<Option<Size>>,
     pub edit_location: Option<EditLocation>,
     pub edit_location_id: widget::Id,
+    pub inline_rename: Option<InlineRename>,
     pub history_i: usize,
     pub history: Vec<Location>,
     pub config: TabConfig,
@@ -3083,8 +3075,8 @@ pub struct Tab {
     last_right_click: Option<usize>,
     context_menu_selection_opt: Option<Vec<bool>>,
     search_context: Option<SearchContext>,
-    date_time_formatter: DateTimeFormatter<fieldsets::YMDT>,
-    time_formatter: DateTimeFormatter<fieldsets::T>,
+    date_time_formatter: DateTimeFormatter,
+    time_formatter: DateTimeFormatter,
     watch_drag: bool,
     window_id: Option<window::Id>,
     large_image_manager: LargeImageManager,
@@ -3132,7 +3124,7 @@ async fn calculate_checksums(path: &Path) -> Result<FileChecksums, String> {
         }
 
         Ok(FileChecksums {
-            sha256: format!("{:x}", sha256_hasher.finalize()),
+            sha256: hex::encode(sha256_hasher.finalize()),
         })
     })
     .await
@@ -3265,6 +3257,7 @@ impl Tab {
             item_view_size_opt: Cell::new(None),
             edit_location: None,
             edit_location_id: widget::Id::unique(),
+            inline_rename: None,
             history_i: 0,
             history,
             config,
@@ -3958,11 +3951,42 @@ impl Tab {
         }
     }
 
+    pub fn cancel_inline_rename(&mut self) {
+        self.inline_rename = None;
+    }
+
+    pub fn commit_or_cancel_inline_rename(&mut self) -> Option<Command> {
+        let rename = self.inline_rename.take()?;
+        let trimmed = rename.name.trim();
+
+        if trimmed.is_empty()
+            || trimmed == rename.original_name
+            || trimmed.contains('/')
+            || trimmed == "."
+            || trimmed == ".."
+        {
+            return None;
+        }
+
+        let parent = rename.path.parent()?;
+        let to = parent.join(trimmed);
+        if to != rename.path && to.exists() {
+            if to.is_dir() {
+                return Some(Command::Toast(fl!("folder-already-exists")));
+            } else {
+                return Some(Command::Toast(fl!("file-already-exists")));
+            }
+        }
+
+        Some(Command::Rename(rename.path, to))
+    }
+
     pub fn change_location(&mut self, location: &Location, history_i_opt: Option<usize>) {
         self.location = location.normalize();
         self.location_ancestors = self.location.ancestors();
         self.location_title = self.location.title();
         self.edit_location = None;
+        self.inline_rename = None;
         self.items_opt = None;
         //TODO: remember scroll by location?
         self.scroll_opt = None;
@@ -4076,6 +4100,9 @@ impl Tab {
                 self.watch_drag = true;
             }
             Message::DoubleClick(click_i_opt) => {
+                if let Some(cmd) = self.commit_or_cancel_inline_rename() {
+                    commands.push(cmd);
+                }
                 if let Some(clicked_item) = self
                     .items_opt
                     .as_ref()
@@ -4099,6 +4126,9 @@ impl Tab {
             Message::Click(click_i_opt) => {
                 self.selected_clicked = false;
                 self.edit_location = None;
+                if let Some(cmd) = self.commit_or_cancel_inline_rename() {
+                    commands.push(cmd);
+                }
                 if click_i_opt.is_none() {
                     self.clicked = click_i_opt;
                 }
@@ -4265,8 +4295,7 @@ impl Tab {
                 // Use the hover state, which is updated as the pointer moves over the rows, to
                 // recover the clicked item when the menu reports that it opened.
                 self.edit_location = None;
-                self.context_menu_selection_opt =
-                    Some(self.context_menu_selection(&modifiers));
+                self.context_menu_selection_opt = Some(self.context_menu_selection(&modifiers));
                 let click_i_opt = self
                     .items_opt
                     .as_ref()
@@ -4910,6 +4939,9 @@ impl Tab {
                 }
             }
             Message::Reload => {
+                if let Some(cmd) = self.commit_or_cancel_inline_rename() {
+                    commands.push(cmd);
+                }
                 //TODO: support keeping selected locations without paths
                 let selected_paths = self
                     .selected_locations()
@@ -4924,7 +4956,160 @@ impl Tab {
                     Some(selected_paths),
                 ));
             }
+            Message::RenameStart(click_i_opt) => {
+                if let Some(cmd) = self.commit_or_cancel_inline_rename() {
+                    commands.push(cmd);
+                }
+                self.edit_location = None;
+
+                let item_index = click_i_opt.or_else(|| {
+                    if let Some(focus_i) = self.select_focus {
+                        if self
+                            .items_opt
+                            .as_ref()
+                            .and_then(|items| items.get(focus_i))
+                            .is_some_and(|item| item.selected)
+                        {
+                            return Some(focus_i);
+                        }
+                    }
+                    self.items_opt
+                        .as_ref()
+                        .and_then(|items| items.iter().position(|item| item.selected))
+                });
+
+                if let Some(index) = item_index
+                    && let Some(items) = self.items_opt.as_ref()
+                    && let Some(item) = items.get(index)
+                {
+                    if item.is_mount_point || matches!(item.metadata, ItemMetadata::Trash { .. }) {
+                        return commands;
+                    }
+                    let Some(path) = item.path_opt() else {
+                        return commands;
+                    };
+                    if path.parent().is_none() {
+                        return commands;
+                    }
+
+                    let original_name = item.name.clone();
+                    let id = widget::Id::unique();
+                    let is_dir = item.metadata.is_dir();
+                    let path = path.clone();
+
+                    self.inline_rename = Some(InlineRename {
+                        index,
+                        path,
+                        name: original_name.clone(),
+                        original_name: original_name.clone(),
+                        id: id.clone(),
+                        is_dir,
+                    });
+
+                    // Ensure only this item is selected and focused
+                    self.select_focus = Some(index);
+                    self.select_range = Some((index, index));
+                    if let Some(ref mut items) = self.items_opt {
+                        for (i, it) in items.iter_mut().enumerate() {
+                            it.selected = i == index;
+                        }
+                    }
+
+                    let select_task = if is_dir {
+                        widget::text_input::select_all(id.clone())
+                    } else {
+                        match original_name.rfind('.') {
+                            Some(pos) if pos > 0 => {
+                                widget::text_input::select_range(id.clone(), 0, pos)
+                            }
+                            _ => widget::text_input::select_all(id.clone()),
+                        }
+                    };
+
+                    commands.push(Command::Iced(
+                        cosmic::Task::batch([widget::text_input::focus(id), select_task]).into(),
+                    ));
+
+                    if let Some(offset) = self.select_focus_scroll() {
+                        commands.push(Command::Iced(
+                            scrollable::scroll_to(
+                                self.scrollable_id.clone(),
+                                AbsoluteOffset {
+                                    x: Some(offset.x),
+                                    y: Some(offset.y),
+                                },
+                            )
+                            .into(),
+                        ));
+                    }
+                }
+            }
+            Message::RenameInput(new_name) => {
+                if let Some(ref mut rename) = self.inline_rename {
+                    rename.name = new_name;
+                }
+            }
+            Message::RenameSubmit(submitted_opt) => {
+                if let Some(ref mut rename) = self.inline_rename {
+                    if let Some(submitted) = submitted_opt {
+                        rename.name = submitted;
+                    }
+                    let trimmed = rename.name.trim();
+
+                    if trimmed == rename.original_name || trimmed.is_empty() {
+                        self.inline_rename = None;
+                        return commands;
+                    }
+
+                    if trimmed == "." || trimmed == ".." {
+                        commands.push(Command::Toast(fl!("name-invalid", filename = trimmed)));
+                        return commands;
+                    }
+
+                    if trimmed.contains('/') {
+                        commands.push(Command::Toast(fl!("name-no-slashes")));
+                        return commands;
+                    }
+
+                    if let Some(parent) = rename.path.parent() {
+                        let to = parent.join(trimmed);
+                        if to != rename.path && to.exists() {
+                            if to.is_dir() {
+                                commands.push(Command::Toast(fl!("folder-already-exists")));
+                            } else {
+                                commands.push(Command::Toast(fl!("file-already-exists")));
+                            }
+                            return commands;
+                        }
+
+                        let from = rename.path.clone();
+                        self.inline_rename = None;
+                        commands.push(Command::Rename(from, to));
+                    } else {
+                        self.inline_rename = None;
+                    }
+                }
+            }
+            Message::RenameNext => {
+                if let Some(cmd) = self.commit_or_cancel_inline_rename() {
+                    commands.push(cmd);
+                }
+                if let Some(items) = self.items_opt.as_ref()
+                    && !items.is_empty()
+                {
+                    let current = self.select_focus.unwrap_or(0);
+                    let next = (current + 1) % items.len();
+                    let next_msg = Message::RenameStart(Some(next));
+                    commands.extend(self.update(next_msg, modifiers));
+                }
+            }
+            Message::RenameCancel => {
+                self.cancel_inline_rename();
+            }
             Message::RightClick(_point_opt, click_i_opt) => {
+                if let Some(cmd) = self.commit_or_cancel_inline_rename() {
+                    commands.push(cmd);
+                }
                 self.select_right_clicked_item(click_i_opt, modifiers);
                 //TODO: hack for clearing selecting when right clicking empty space
                 self.last_right_click = click_i_opt;
@@ -6303,53 +6488,76 @@ impl Tab {
 
                 // Only build elements if visible (for performance)
                 if item_rect.intersects(&visible_rect) {
-                    //TODO: one focus group per grid item (needs custom widget)
-                    let buttons: Vec<Element<Message>> = vec![
-                        widget::button::custom(
-                            widget::icon::icon(item.thumbnail_or_icon(&item.icon_handle_grid))
-                                .content_fit(ContentFit::Contain)
-                                .size(icon_sizes.grid()),
-                        )
-                        .padding(space_xxxs)
-                        .class(button_style(
-                            item.selected,
-                            item.highlighted,
-                            item.cut,
-                            false,
-                            false,
-                            false,
-                        ))
-                        .into(),
-                        widget::tooltip(
-                            widget::button::custom(Item::grid_display_name(&item.display_name))
-                                .id(item.button_id.clone())
-                                .padding([0, space_xxxs])
-                                .class(button_style(
-                                    item.selected,
-                                    item.highlighted,
-                                    item.cut,
-                                    true,
-                                    true,
-                                    matches!(self.mode, Mode::Desktop),
-                                )),
-                            widget::text::body(&item.name),
-                            widget::tooltip::Position::Bottom,
-                        )
-                        .into(),
-                    ];
+                    let is_renaming = self
+                        .inline_rename
+                        .as_ref()
+                        .is_some_and(|r| item.path_opt() == Some(&r.path));
 
-                    let mut column = widget::column::with_capacity(buttons.len())
+                    let icon_button = widget::button::custom(
+                        widget::icon::icon(item.thumbnail_or_icon(&item.icon_handle_grid))
+                            .content_fit(ContentFit::Contain)
+                            .size(icon_sizes.grid()),
+                    )
+                    .padding(space_xxxs)
+                    .class(button_style(
+                        item.selected,
+                        item.highlighted,
+                        item.cut,
+                        false,
+                        false,
+                        false,
+                    ));
+
+                    let mut column = widget::column::with_capacity(2)
                         .align_x(Alignment::Center)
                         .height(Length::Fixed(item_height as f32))
                         .width(Length::Fixed(item_width as f32));
-                    for button in buttons {
-                        column = column.push(
-                            mouse_area::MouseArea::new(button)
-                                .on_right_press_no_capture()
-                                .on_right_press(move |point_opt| {
-                                    Message::RightClick(point_opt, Some(i))
-                                }),
-                        );
+
+                    if is_renaming {
+                        let rename = self.inline_rename.as_ref().unwrap();
+                        let input = widget::text_input("", &rename.name)
+                            .id(rename.id.clone())
+                            .double_click_select_delimiter('.')
+                            .on_input(Message::RenameInput)
+                            .on_submit(|name| Message::RenameSubmit(Some(name)))
+                            .on_tab(Message::RenameNext)
+                            .width(Length::Fixed(
+                                (item_width.saturating_sub(space_xxs as usize * 2)) as f32,
+                            ))
+                            .padding([2, space_xxxs]);
+
+                        column = column.push(icon_button);
+                        column = column.push(input);
+                    } else {
+                        let buttons: Vec<Element<Message>> = vec![
+                            icon_button.into(),
+                            widget::tooltip(
+                                widget::button::custom(Item::grid_display_name(&item.display_name))
+                                    .id(item.button_id.clone())
+                                    .padding([0, space_xxxs])
+                                    .class(button_style(
+                                        item.selected,
+                                        item.highlighted,
+                                        item.cut,
+                                        true,
+                                        true,
+                                        matches!(self.mode, Mode::Desktop),
+                                    )),
+                                widget::text::body(&item.name),
+                                widget::tooltip::Position::Bottom,
+                            )
+                            .into(),
+                        ];
+
+                        for button in buttons {
+                            column = column.push(
+                                mouse_area::MouseArea::new(button)
+                                    .on_right_press_no_capture()
+                                    .on_right_press(move |point_opt| {
+                                        Message::RightClick(point_opt, Some(i))
+                                    }),
+                            );
+                        }
                     }
 
                     let column: Element<Message> =
@@ -6359,7 +6567,7 @@ impl Tab {
                             column.into()
                         };
 
-                    if item.selected {
+                    if !is_renaming && item.selected {
                         dnd_items.push((i, (row, col), item));
                         drag_w_i = drag_w_i.min(col);
                         drag_n_i = drag_n_i.min(row);
@@ -6541,7 +6749,10 @@ impl Tab {
         bool,
     ) {
         let cosmic_theme::Spacing {
-            space_s, space_xxs, ..
+            space_s,
+            space_xxs,
+            space_xxxs,
+            ..
         } = theme::spacing();
 
         let TabConfig {
@@ -6694,6 +6905,8 @@ impl Tab {
                         }
                     };
 
+                    let is_renaming = self.inline_rename.as_ref().map_or(false, |r| r.index == i);
+
                     let row = if condensed {
                         widget::row::with_children([
                             widget::icon::icon(
@@ -6703,11 +6916,24 @@ impl Tab {
                             .size(icon_size)
                             .into(),
                             widget::column::with_children([
-                                Item::list_display_name(item.display_name.clone()).into(),
+                                if is_renaming {
+                                    let rename = self.inline_rename.as_ref().unwrap();
+                                    widget::text_input("", &rename.name)
+                                        .id(rename.id.clone())
+                                        .double_click_select_delimiter('.')
+                                        .on_input(Message::RenameInput)
+                                        .on_submit(|name| Message::RenameSubmit(Some(name)))
+                                        .on_tab(Message::RenameNext)
+                                        .padding([2, space_xxxs])
+                                        .into()
+                                } else {
+                                    Item::list_display_name(item.display_name.clone()).into()
+                                },
                                 //TODO: translate?
                                 widget::text::caption(format!("{modified_text} - {size_text}"))
                                     .into(),
                             ])
+                            .width(Length::Fill)
                             .into(),
                         ])
                         .height(Length::Fixed(f32::from(row_height)))
@@ -6722,7 +6948,19 @@ impl Tab {
                             .size(icon_size)
                             .into(),
                             widget::column::with_children([
-                                Item::list_display_name(item.display_name.clone()).into(),
+                                if is_renaming {
+                                    let rename = self.inline_rename.as_ref().unwrap();
+                                    widget::text_input("", &rename.name)
+                                        .id(rename.id.clone())
+                                        .double_click_select_delimiter('.')
+                                        .on_input(Message::RenameInput)
+                                        .on_submit(|name| Message::RenameSubmit(Some(name)))
+                                        .on_tab(Message::RenameNext)
+                                        .padding([2, space_xxxs])
+                                        .into()
+                                } else {
+                                    Item::list_display_name(item.display_name.clone()).into()
+                                },
                                 widget::text::caption(match item.path_opt() {
                                     Some(path) => path.display().to_string(),
                                     None => String::new(),
@@ -6747,9 +6985,22 @@ impl Tab {
                                 .content_fit(ContentFit::Contain)
                                 .size(icon_size)
                                 .into(),
-                            Item::list_display_name(item.display_name.clone())
-                                .width(Length::Fill)
-                                .into(),
+                            if is_renaming {
+                                let rename = self.inline_rename.as_ref().unwrap();
+                                widget::text_input("", &rename.name)
+                                    .id(rename.id.clone())
+                                    .double_click_select_delimiter('.')
+                                    .on_input(Message::RenameInput)
+                                    .on_submit(|name| Message::RenameSubmit(Some(name)))
+                                    .on_tab(Message::RenameNext)
+                                    .width(Length::Fill)
+                                    .padding([2, space_xxxs])
+                                    .into()
+                            } else {
+                                Item::list_display_name(item.display_name.clone())
+                                    .width(Length::Fill)
+                                    .into()
+                            },
                             widget::text::body(modified_text.clone())
                                 .width(Length::Fixed(modified_width))
                                 .into(),
@@ -6762,35 +7013,60 @@ impl Tab {
                         .spacing(space_xxs)
                     };
 
-                    let button =
-                        |row| {
-                            let mouse_area = crate::mouse_area::MouseArea::new(
-                                widget::button::custom(row)
-                                    .width(Length::Fill)
-                                    .id(item.button_id.clone())
-                                    .padding([0, space_xxs])
-                                    .class(button_style(
-                                        item.selected,
-                                        item.highlighted,
-                                        item.cut,
-                                        true,
-                                        true,
-                                        false,
+                    let button_row: Element<_> = if is_renaming {
+                        let row_container = widget::container(row)
+                            .width(Length::Fill)
+                            .padding([0, space_xxs])
+                            .class(theme::Container::Custom(Box::new(|theme| {
+                                let cosmic = theme.cosmic();
+                                cosmic::iced::widget::container::Style {
+                                    background: Some(cosmic::iced::Background::Color(
+                                        cosmic.bg_component_color().into(),
                                     )),
-                            )
-                            .on_press(move |_| Message::Click(Some(i)))
+                                    border: cosmic::iced::Border {
+                                        radius: cosmic.radius_xs().into(),
+                                        ..Default::default()
+                                    },
+                                    ..Default::default()
+                                }
+                            })));
+                        let mouse_area = crate::mouse_area::MouseArea::new(row_container)
                             .on_double_click(move |_| Message::DoubleClick(Some(i)))
                             .on_release(move |_| Message::ClickRelease(Some(i)))
                             .on_middle_press(move |_| Message::MiddleClick(i))
                             .on_enter(move || Message::HighlightActivate(i))
                             .on_exit(move || Message::HighlightDeactivate(i));
+                        mouse_area.into()
+                    } else {
+                        let mouse_area = crate::mouse_area::MouseArea::new(
+                            widget::button::custom(row)
+                                .width(Length::Fill)
+                                .id(item.button_id.clone())
+                                .padding([0, space_xxs])
+                                .class(button_style(
+                                    item.selected,
+                                    item.highlighted,
+                                    item.cut,
+                                    true,
+                                    true,
+                                    false,
+                                )),
+                        )
+                        .on_press(move |_| Message::Click(Some(i)))
+                        .on_double_click(move |_| Message::DoubleClick(Some(i)))
+                        .on_release(move |_| Message::ClickRelease(Some(i)))
+                        .on_middle_press(move |_| Message::MiddleClick(i))
+                        .on_enter(move || Message::HighlightActivate(i))
+                        .on_exit(move || Message::HighlightDeactivate(i));
 
-                            mouse_area.on_right_press_no_capture().on_right_press(
-                                move |point_opt| Message::RightClick(point_opt, Some(i)),
-                            )
-                        };
+                        mouse_area
+                            .on_right_press_no_capture()
+                            .on_right_press(move |point_opt| {
+                                Message::RightClick(point_opt, Some(i))
+                            })
+                            .into()
+                    };
 
-                    let button_row = button(row.into());
                     let button_row: Element<_> = if item.metadata.is_dir()
                         && let Some(location) = item.location_opt.as_ref()
                     {
@@ -6799,8 +7075,8 @@ impl Tab {
                         button_row.into()
                     };
 
-                    if item.selected || !drag_items.is_empty() {
-                        let dnd_row = if !item.selected {
+                    if (!is_renaming && item.selected) || !drag_items.is_empty() {
+                        let dnd_row = if is_renaming || !item.selected {
                             Element::from(
                                 space::vertical().height(Length::Fixed(f32::from(row_height))),
                             )
@@ -6872,8 +7148,36 @@ impl Tab {
                             .into()
                         };
                         if item.selected {
+                            let mouse_area = crate::mouse_area::MouseArea::new(
+                                widget::button::custom(dnd_row)
+                                    .width(Length::Fill)
+                                    .id(item.button_id.clone())
+                                    .padding([0, space_xxs])
+                                    .class(button_style(
+                                        item.selected,
+                                        item.highlighted,
+                                        item.cut,
+                                        true,
+                                        true,
+                                        false,
+                                    )),
+                            )
+                            .on_press(move |_| Message::Click(Some(i)))
+                            .on_double_click(move |_| Message::DoubleClick(Some(i)))
+                            .on_release(move |_| Message::ClickRelease(Some(i)))
+                            .on_middle_press(move |_| Message::MiddleClick(i))
+                            .on_enter(move || Message::HighlightActivate(i))
+                            .on_exit(move || Message::HighlightDeactivate(i));
+
+                            let dnd_button_row: Element<'static, Message> = mouse_area
+                                .on_right_press_no_capture()
+                                .on_right_press(move |point_opt| {
+                                    Message::RightClick(point_opt, Some(i))
+                                })
+                                .into();
+
                             drag_items.push(
-                                widget::container(button(dnd_row))
+                                widget::container(dnd_button_row)
                                     .width(Length::Shrink)
                                     .into(),
                             );
@@ -8298,12 +8602,12 @@ mod tests {
     use std::path::PathBuf;
     use std::{fs, io};
 
+    use ::mime;
     use cosmic::iced::mouse::ScrollDelta;
     use cosmic::iced::runtime::keyboard::Modifiers;
     use cosmic::iced::{Point, Rectangle, Size};
     use cosmic::widget;
     use log::{debug, trace};
-    use mime_guess::mime;
     use tempfile::TempDir;
     use test_log::test;
 
@@ -9233,6 +9537,128 @@ mod tests {
                 thumb
             ),
         }
+        Ok(())
+    }
+
+    #[test]
+    fn tab_inline_rename_starts_and_submits_valid() -> io::Result<()> {
+        let (_fs, mut tab) = tab_click_new(NUM_FILES, NUM_NESTED, NUM_DIRS, NUM_NESTED, NAME_LEN)?;
+        let items = tab.items_opt().expect("items should exist");
+        assert!(!items.is_empty());
+        let orig_name = items[0].name.clone();
+        let orig_path = items[0].path_opt().unwrap().clone();
+
+        // Start rename on item 0
+        tab.update(Message::RenameStart(Some(0)), Modifiers::empty());
+        assert!(tab.inline_rename.is_some());
+        assert_eq!(tab.inline_rename.as_ref().unwrap().index, 0);
+        assert_eq!(tab.inline_rename.as_ref().unwrap().name, orig_name);
+
+        // Input new name
+        let new_name = format!("{orig_name}_renamed");
+        tab.update(Message::RenameInput(new_name.clone()), Modifiers::empty());
+        assert_eq!(tab.inline_rename.as_ref().unwrap().name, new_name);
+
+        // Submit rename
+        let cmds = tab.update(Message::RenameSubmit(None), Modifiers::empty());
+        assert!(tab.inline_rename.is_none());
+        assert_eq!(cmds.len(), 1);
+        match &cmds[0] {
+            Command::Rename(from, to) => {
+                assert_eq!(from, &orig_path);
+                assert_eq!(to.file_name().unwrap().to_str().unwrap(), &new_name);
+            }
+            other => panic!("expected Command::Rename, got {other:?}"),
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn tab_inline_rename_cancel_reverts() -> io::Result<()> {
+        let (_fs, mut tab) = tab_click_new(NUM_FILES, NUM_NESTED, NUM_DIRS, NUM_NESTED, NAME_LEN)?;
+
+        tab.update(Message::RenameStart(Some(0)), Modifiers::empty());
+        assert!(tab.inline_rename.is_some());
+
+        tab.update(
+            Message::RenameInput("discarded_edit".into()),
+            Modifiers::empty(),
+        );
+        let cmds = tab.update(Message::RenameCancel, Modifiers::empty());
+        assert!(tab.inline_rename.is_none());
+        assert!(cmds.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn tab_inline_rename_invalid_names_emit_toast() -> io::Result<()> {
+        let (_fs, mut tab) = tab_click_new(NUM_FILES, NUM_NESTED, NUM_DIRS, NUM_NESTED, NAME_LEN)?;
+
+        for invalid in [".", "..", "invalid/slash", "nested/name/here"] {
+            tab.update(Message::RenameStart(Some(0)), Modifiers::empty());
+            assert!(tab.inline_rename.is_some());
+
+            tab.update(Message::RenameInput(invalid.into()), Modifiers::empty());
+            let cmds = tab.update(Message::RenameSubmit(None), Modifiers::empty());
+            assert!(
+                tab.inline_rename.is_some(),
+                "rename remains active for correction"
+            );
+            assert_eq!(cmds.len(), 1, "expected 1 toast command for {invalid}");
+            assert!(matches!(cmds[0], Command::Toast(_)));
+
+            tab.update(Message::RenameCancel, Modifiers::empty());
+            assert!(tab.inline_rename.is_none());
+        }
+
+        // Empty string cancels without toast
+        tab.update(Message::RenameStart(Some(0)), Modifiers::empty());
+        tab.update(Message::RenameInput("".into()), Modifiers::empty());
+        let cmds = tab.update(Message::RenameSubmit(None), Modifiers::empty());
+        assert!(tab.inline_rename.is_none());
+        assert!(cmds.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn tab_inline_rename_tab_cycles_to_next_item() -> io::Result<()> {
+        let (_fs, mut tab) = tab_click_new(NUM_FILES, NUM_NESTED, NUM_DIRS, NUM_NESTED, NAME_LEN)?;
+        let items_len = tab.items_opt().unwrap().len();
+        assert!(items_len >= 2);
+
+        // Start rename on item 0
+        tab.update(Message::RenameStart(Some(0)), Modifiers::empty());
+        assert_eq!(tab.inline_rename.as_ref().unwrap().index, 0);
+
+        // Press Tab (RenameNext) without changing name -> should cycle to item 1
+        let cmds = tab.update(Message::RenameNext, Modifiers::empty());
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Command::Rename(..))),
+            "no rename command when name unchanged"
+        );
+        assert_eq!(tab.inline_rename.as_ref().unwrap().index, 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn tab_inline_rename_outside_click_commits() -> io::Result<()> {
+        let (_fs, mut tab) = tab_click_new(NUM_FILES, NUM_NESTED, NUM_DIRS, NUM_NESTED, NAME_LEN)?;
+        let items = tab.items_opt().unwrap();
+        let orig_name = items[0].name.clone();
+
+        tab.update(Message::RenameStart(Some(0)), Modifiers::empty());
+        let new_name = format!("{orig_name}_clicked");
+        tab.update(Message::RenameInput(new_name.clone()), Modifiers::empty());
+
+        // Simulate click outside
+        let cmds = tab.update(Message::Click(None), Modifiers::empty());
+        assert!(tab.inline_rename.is_none());
+        assert!(cmds.iter().any(|cmd| matches!(cmd, Command::Rename(_, to) if to.file_name().unwrap() == new_name.as_str())));
+
         Ok(())
     }
 }

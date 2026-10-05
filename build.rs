@@ -1,7 +1,11 @@
+#[cfg(feature = "desktop-metadata")]
 use std::path::PathBuf;
+#[cfg(feature = "desktop-metadata")]
 use std::{env, fs};
+#[cfg(feature = "desktop-metadata")]
 use xdgen::{App, Context, FluentString};
 
+#[cfg(feature = "desktop-metadata")]
 fn main() {
     let id = "com.system76.CosmicFiles";
     let ctx = Context::new("i18n", env::var("CARGO_PKG_NAME").unwrap()).unwrap();
@@ -23,3 +27,6 @@ fn main() {
     )
     .unwrap();
 }
+
+#[cfg(not(feature = "desktop-metadata"))]
+fn main() {}

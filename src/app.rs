@@ -9,7 +9,7 @@ use cosmic::iced::core::SmolStr;
 use cosmic::iced::core::widget::operation::focusable::unfocus;
 use cosmic::iced::futures::{self, SinkExt};
 use cosmic::iced::keyboard::key::Physical;
-use cosmic::iced::keyboard::{Event as KeyEvent, Key, Modifiers};
+use cosmic::iced::keyboard::{Event as KeyEvent, Key, Modifiers, key::Named};
 #[cfg(all(feature = "wayland", feature = "desktop-applet"))]
 use cosmic::iced::platform_specific::shell::wayland::commands::overlap_notify::overlap_notify;
 use cosmic::iced::runtime::{clipboard, task};
@@ -36,7 +36,7 @@ use cosmic::widget::menu::key_bind::KeyBind;
 use cosmic::widget::segmented_button::{self, Entity, ReorderEvent};
 use cosmic::widget::{self, icon, settings, space};
 use cosmic::{Application, ApplicationExt, Element, cosmic_theme, executor, surface, theme};
-use mime_guess::Mime;
+use mime::Mime;
 use notify_debouncer_full::notify::{self, RecommendedWatcher};
 use notify_debouncer_full::{DebouncedEvent, Debouncer, RecommendedCache, new_debouncer};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -359,6 +359,7 @@ pub enum Message {
     DialogPush(DialogPage, Option<widget::Id>),
     DialogUpdate(DialogPage),
     DialogUpdateComplete(DialogPage),
+    Escape,
     ExtractHere(Option<Entity>),
     ExtractTo(Option<Entity>),
     ExtractToResult(DialogResult),
@@ -569,7 +570,7 @@ pub enum DialogPage {
     },
     OpenWith {
         path: PathBuf,
-        mime: mime_guess::Mime,
+        mime: Mime,
         selected: usize,
         store_opt: Option<Arc<MimeApp>>,
         search_app_name: String,
@@ -873,7 +874,7 @@ impl App {
                 match open::that_detached(&path) {
                     Ok(()) => {
                         if self.config.show_recents {
-                            let _ = recently_used_xbel::update_recently_used(
+                            let _ = crate::recently_used::update_recently_used(
                                 &path,
                                 Self::APP_ID.to_string(),
                                 "cosmic-files".to_string(),
@@ -956,8 +957,8 @@ impl App {
                     Ok(()) => {
                         if self.config.show_recents {
                             for path in paths {
-                                let _ = recently_used_xbel::update_recently_used(
-                                    &path.into(),
+                                let _ = crate::recently_used::update_recently_used(
+                                    path.as_ref(),
                                     Self::APP_ID.to_string(),
                                     "cosmic-files".to_string(),
                                     None,
@@ -2790,6 +2791,14 @@ impl Application for App {
             return Task::none();
         }
 
+        // Cancel inline rename if active
+        if let Some(tab) = self.tab_model.data_mut::<Tab>(entity)
+            && tab.inline_rename.is_some()
+        {
+            tab.cancel_inline_rename();
+            return Task::none();
+        }
+
         // Close menus and context panes in order per message
         // Why: It'd be weird to close everything all at once
         // Usually, the Escape key (for example) closes menus and panes one by one instead
@@ -3111,6 +3120,7 @@ impl Application for App {
                     return Task::batch(tasks);
                 }
             }
+            Message::Escape => return self.on_escape(),
             Message::DialogCancel => {
                 if let Some((_page, task)) = self.dialog_pages.pop_front() {
                     return task;
@@ -3221,7 +3231,7 @@ impl Application for App {
                                     match spawn_detached(&mut command) {
                                         Ok(()) => {
                                             if self.config.show_recents {
-                                                let _ = recently_used_xbel::update_recently_used(
+                                                let _ = crate::recently_used::update_recently_used(
                                                     &path,
                                                     Self::APP_ID.to_string(),
                                                     "cosmic-files".to_string(),
@@ -3872,7 +3882,7 @@ impl Application for App {
                                     mime: item.mime.clone(),
                                     selected: 0,
                                     store_opt: "x-scheme-handler/mime"
-                                        .parse::<mime_guess::Mime>()
+                                        .parse::<Mime>()
                                         .ok()
                                         .and_then(|mime| {
                                             self.mime_app_cache.get(&mime).first().cloned()
@@ -4266,49 +4276,10 @@ impl Application for App {
                 return Task::batch([self.rescan_trash(), self.update_desktop()]);
             }
             Message::Rename(entity_opt) => {
-                let entity = entity_opt.unwrap_or_else(|| self.tab_model.active());
-                if let Some(tab) = self.tab_model.data_mut::<Tab>(entity)
-                    && let Some(items) = tab.items_opt()
-                {
-                    let selected: Box<[_]> = items
-                        .iter()
-                        .filter_map(|item| {
-                            if item.selected {
-                                item.path_opt().cloned()
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-                    if !selected.is_empty() {
-                        //TODO: batch rename
-                        let mut last_name = String::new();
-                        let tasks: Vec<_> = selected
-                            .into_iter()
-                            .filter_map(|path| {
-                                let parent = path.parent()?.to_path_buf();
-                                let name = path.file_name()?.to_str()?.to_string();
-                                let dir = path.is_dir();
-                                last_name = name.clone();
-                                Some(self.dialog_pages.push_back(DialogPage::RenameItem {
-                                    from: path,
-                                    parent,
-                                    name,
-                                    dir,
-                                }))
-                            })
-                            .collect();
-                        let tasks = tasks.into_iter().chain([
-                            widget::text_input::focus(self.dialog_text_input.clone()),
-                            widget::text_input::select_until_last(
-                                self.dialog_text_input.clone(),
-                                &last_name,
-                                '.',
-                            ),
-                        ]);
-                        return Task::batch(tasks);
-                    }
-                }
+                return self.update(Message::TabMessage(
+                    entity_opt,
+                    tab::Message::RenameStart(None),
+                ));
             }
             Message::ReplaceResult(replace_result) => {
                 if let Some((dialog_page, task)) = self.dialog_pages.pop_front() {
@@ -4387,6 +4358,30 @@ impl Application for App {
             }
             Message::TabActivate(entity) => {
                 let mut tasks = vec![];
+
+                let active = self.tab_model.active();
+                if active != entity {
+                    if let Some(tab) = self.tab_model.data_mut::<Tab>(active) {
+                        if let Some(cmd) = tab.commit_or_cancel_inline_rename() {
+                            match cmd {
+                                tab::Command::Rename(from, to) => {
+                                    tasks.push(self.operation(Operation::Rename { from, to }));
+                                }
+                                tab::Command::Toast(msg) => {
+                                    tasks.push(
+                                        self.toasts
+                                            .push(widget::toaster::Toast::new(msg))
+                                            .map(cosmic::Action::App),
+                                    );
+                                }
+                                tab::Command::Action(action) => {
+                                    tasks.push(self.update(action.message(Some(active))));
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
 
                 // Activate new tab
                 self.tab_model.activate(entity);
@@ -4558,7 +4553,7 @@ impl Application for App {
                             commands.push(self.update(Message::PasteContents(to, from)));
                         }
                         tab::Command::ClearRecents => {
-                            match recently_used_xbel::clear_recently_used() {
+                            match crate::recently_used::clear_recently_used() {
                                 Ok(()) => {}
                                 Err(err) => {
                                     log::warn!("failed to clear recents history: {}", err);
@@ -4695,6 +4690,16 @@ impl Application for App {
                                     cosmic::action::app(Message::SaveSortNames)
                                 });
                             }
+                        }
+                        tab::Command::Rename(from, to) => {
+                            commands.push(self.operation(Operation::Rename { from, to }));
+                        }
+                        tab::Command::Toast(msg) => {
+                            commands.push(
+                                self.toasts
+                                    .push(widget::toaster::Toast::new(msg))
+                                    .map(cosmic::Action::App),
+                            );
                         }
                     }
                 }
@@ -5049,7 +5054,7 @@ impl Application for App {
                 }
             }
             Message::NavMenuAction(action) => match action {
-                NavMenuAction::ClearRecents => match recently_used_xbel::clear_recently_used() {
+                NavMenuAction::ClearRecents => match crate::recently_used::clear_recently_used() {
                     Ok(()) => {}
                     Err(err) => {
                         log::warn!("failed to clear recents history: {}", err);
@@ -5084,7 +5089,7 @@ impl Application for App {
                                         mime: item.mime,
                                         selected: 0,
                                         store_opt: "x-scheme-handler/mime"
-                                            .parse::<mime_guess::Mime>()
+                                            .parse::<Mime>()
                                             .ok()
                                             .and_then(|mime| {
                                                 self.mime_app_cache.get(&mime).first().cloned()
@@ -6713,7 +6718,13 @@ impl Application for App {
                     event::Status::Ignored => {
                         Some(Message::Key(window_id, modifiers, key, physical_key, text))
                     }
-                    event::Status::Captured => None,
+                    event::Status::Captured => {
+                        if key == Key::Named(Named::Escape) {
+                            Some(Message::Escape)
+                        } else {
+                            None
+                        }
+                    }
                 },
                 Event::Keyboard(KeyEvent::ModifiersChanged(modifiers)) => {
                     Some(Message::ModifiersChanged(window_id, modifiers))
@@ -6936,7 +6947,7 @@ impl Application for App {
                 stream::channel(
                     1,
                     |mut output: futures::channel::mpsc::Sender<Message>| async move {
-                        let Some(recents_path) = recently_used_xbel::dir() else {
+                        let Some(recents_path) = crate::recently_used::dir() else {
                             log::warn!(
                                 "failed to watch recents changes: .recently_used.xbel does not exist"
                             );

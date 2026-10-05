@@ -8,7 +8,7 @@ use cosmic::widget::menu::{self, ItemHeight, ItemWidth, MenuBar};
 use cosmic::widget::{self, responsive_menu_bar};
 use cosmic::{Element, theme};
 use i18n_embed::LanguageLoader;
-use mime_guess::Mime;
+use mime::Mime;
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
@@ -225,15 +225,19 @@ pub fn context_menu<'a>(
                 }
                 children.push(menu_item(fl!("copy-to"), Action::CopyTo));
 
-                children.push(menu::Item::Divider);
-                let supported_archive_types = crate::archive::SUPPORTED_ARCHIVE_TYPES;
-                selected_types.retain(|t| supported_archive_types.iter().copied().all(|m| *t != m));
-                if selected_types.is_empty() {
-                    children.push(menu_item(fl!("extract-here"), Action::ExtractHere));
-                    children.push(menu_item(fl!("extract-to"), Action::ExtractTo));
+                #[cfg(feature = "archives")]
+                {
+                    children.push(menu::Item::Divider);
+                    let supported_archive_types = crate::archive::SUPPORTED_ARCHIVE_TYPES;
+                    selected_types
+                        .retain(|t| supported_archive_types.iter().copied().all(|m| *t != m));
+                    if selected_types.is_empty() {
+                        children.push(menu_item(fl!("extract-here"), Action::ExtractHere));
+                        children.push(menu_item(fl!("extract-to"), Action::ExtractTo));
+                    }
+                    children.push(menu_item(fl!("compress"), Action::Compress));
+                    children.push(menu::Item::Divider);
                 }
-                children.push(menu_item(fl!("compress"), Action::Compress));
-                children.push(menu::Item::Divider);
 
                 //TODO: Print?
                 children.push(menu_item(fl!("show-details"), Action::Preview));

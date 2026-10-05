@@ -3,7 +3,7 @@
 
 use bstr::{BString, ByteSlice, ByteVec};
 use cosmic::widget;
-pub use mime_guess::Mime;
+pub use mime::Mime;
 #[cfg(feature = "desktop")]
 use notify_debouncer_full::notify;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -270,7 +270,7 @@ impl MimeAppCache {
 
         let include_mime = match mime_type.type_().as_str() {
             "audio" => Some("video/mp4".parse::<Mime>().expect("video/mp4 mime")),
-            "text" => Some(mime_guess::mime::TEXT_PLAIN),
+            "text" => Some(mime::TEXT_PLAIN),
             _ => None,
         };
 

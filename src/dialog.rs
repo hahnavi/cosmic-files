@@ -1,6 +1,7 @@
 // Copyright 2023 System76 <info@system76.com>
 // SPDX-License-Identifier: GPL-3.0-only
 
+use crate::recently_used::update_recently_used;
 use cosmic::app::cosmic::Cosmic;
 use cosmic::app::{Core, Task, context_drawer};
 use cosmic::iced::core::SmolStr;
@@ -18,10 +19,9 @@ use cosmic::widget::menu::key_bind::Modifier;
 use cosmic::widget::menu::{Action as MenuAction, KeyBind};
 use cosmic::widget::{self, Operation, segmented_button};
 use cosmic::{Application, ApplicationExt, Element, cosmic_config, cosmic_theme, executor, theme};
-use mime_guess::{Mime, mime};
+use mime::{self, Mime};
 use notify_debouncer_full::notify::{self, RecommendedWatcher};
 use notify_debouncer_full::{DebouncedEvent, Debouncer, RecommendedCache, new_debouncer};
-use recently_used_xbel::update_recently_used;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::any::TypeId;
 use std::collections::{HashMap, VecDeque};
