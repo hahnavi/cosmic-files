@@ -35,6 +35,7 @@ mod mounter;
 mod mouse_area;
 pub mod operation;
 mod recently_used;
+pub(crate) mod scrollable;
 mod spawn_detached;
 pub mod tab;
 mod thumbnail_cacher;

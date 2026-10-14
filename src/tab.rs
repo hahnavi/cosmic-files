@@ -1,3 +1,4 @@
+use crate::scrollable;
 #[cfg(feature = "desktop")]
 use cosmic::desktop::fde::{DesktopEntry, get_languages_from_env};
 use cosmic::iced::advanced::graphics;
@@ -8,7 +9,7 @@ use cosmic::iced::core::mouse::ScrollDelta;
 use cosmic::iced::core::widget::tree;
 use cosmic::iced::futures::{self, SinkExt};
 use cosmic::iced::keyboard::Modifiers;
-use cosmic::iced::widget::scrollable::{self, AbsoluteOffset, Viewport};
+use cosmic::iced::widget::scrollable::{AbsoluteOffset, Scroll as ScrollableEvent};
 use cosmic::iced::widget::{rule, stack};
 use cosmic::iced::{
     Alignment, Background, Border, Color, ContentFit, Length, Padding, Point, Rectangle, Size,
@@ -1901,7 +1902,7 @@ pub enum Message {
     RightClick(Option<Point>, Option<usize>),
     MiddleClick(usize),
     Resize(Rectangle),
-    Scroll(Viewport),
+    Scroll(ScrollableEvent),
     ScrollTab(f32),
     ScrollToFocused,
     SearchContext(Location, SearchContextWrapper),
@@ -2586,7 +2587,7 @@ impl Item {
     /// Text widget for a filename in grid/icon view: word-or-glyph wrapping, middle-ellipsized to 3 lines.
     fn grid_display_name<'a>(
         name: impl Into<Cow<'a, str>> + 'a,
-    ) -> widget::Text<'a, cosmic::Theme, cosmic::Renderer> {
+    ) -> widget::Text<'a, cosmic::Theme> {
         widget::text::body(name)
             .wrapping(text::Wrapping::WordOrGlyph)
             .align_x(text::Alignment::Center)
@@ -2598,7 +2599,7 @@ impl Item {
     /// Text widget for a filename in list view: word-or-glyph wrapping, middle-ellipsized to 1 line.
     fn list_display_name<'a>(
         name: impl Into<Cow<'a, str>> + 'a,
-    ) -> widget::Text<'a, cosmic::Theme, cosmic::Renderer> {
+    ) -> widget::Text<'a, cosmic::Theme> {
         widget::text::body(name)
             .wrapping(text::Wrapping::WordOrGlyph)
             .ellipsize(text::Ellipsize::Middle(text::EllipsizeHeightLimit::Lines(
@@ -2662,7 +2663,7 @@ impl Item {
     }
 
     pub fn preview_actions(&self) -> Element<'_, Message> {
-        let mut row = widget::row::with_capacity(3)
+        let mut row = widget::row::with_capacity::<Element<'_, Message>>(3)
             .align_y(Alignment::Center)
             .spacing(theme::spacing().space_xxs)
             .push(
@@ -2695,7 +2696,7 @@ impl Item {
             ..
         } = theme::spacing();
 
-        let mut column = widget::column::with_capacity(4).spacing(space_m);
+        let mut column = widget::column::with_capacity::<Element<'a, Message>>(4).spacing(space_m);
 
         column = column.push(
             widget::container(self.preview())
@@ -2703,7 +2704,8 @@ impl Item {
                 .max_height(THUMBNAIL_SIZE as f32),
         );
 
-        let mut details = widget::column::with_capacity(8).spacing(space_xxxs);
+        let mut details =
+            widget::column::with_capacity::<Element<'_, Message>>(8).spacing(space_xxxs);
         details = details.push(widget::selectable_text::heading(self.name.clone()));
         details = details.push(widget::text::body(fl!(
             "type",
@@ -2865,7 +2867,7 @@ impl Item {
                 ChecksumState::NotCalculated => widget::button::standard(fl!("calculate"))
                     .on_press(Message::CalculateChecksums(path.clone()))
                     .into(),
-                ChecksumState::Calculating => widget::row::with_capacity(2)
+                ChecksumState::Calculating => widget::row::with_capacity::<Element<'_, Message>>(2)
                     .align_y(Alignment::Center)
                     .spacing(space_xxxs)
                     .push(widget::indeterminate_circular().size(16.0))
@@ -2890,7 +2892,7 @@ impl Item {
                     )
                     .on_press(Message::CopyChecksum(value.clone()))
                     .tooltip(fl!("copy"));
-                    widget::row::with_capacity(2)
+                    widget::row::with_capacity::<Element<'_, Message>>(2)
                         .align_y(Alignment::Center)
                         .spacing(space_xxxs)
                         .push(value_text)
@@ -2926,10 +2928,11 @@ impl Item {
     pub fn replace_view(&self, heading: String, military_time: bool) -> Element<'_, Message> {
         let cosmic_theme::Spacing { space_xxxs, .. } = theme::spacing();
 
-        let mut row = widget::row::with_capacity(2).spacing(space_xxxs);
+        let mut row = widget::row::with_capacity::<Element<'_, Message>>(2).spacing(space_xxxs);
         row = row.push(self.preview());
 
-        let mut column = widget::column::with_capacity(3).spacing(space_xxxs);
+        let mut column =
+            widget::column::with_capacity::<Element<'_, Message>>(3).spacing(space_xxxs);
         column = column.push(widget::text::heading(heading));
 
         //TODO: translate!
@@ -5178,7 +5181,7 @@ impl Tab {
                 self.viewport_opt = Some(viewport);
             }
             Message::Scroll(viewport) => {
-                self.scroll_opt = Some(viewport.absolute_offset());
+                self.scroll_opt = Some(viewport.viewport.absolute_offset());
                 self.watch_drag = true;
                 self.evict_offscreen_thumbnails();
             }
@@ -5584,7 +5587,11 @@ impl Tab {
                 ));
             }
             Message::CopyChecksum(value) => {
-                commands.push(Command::Iced(cosmic::iced::clipboard::write(value).into()));
+                commands.push(Command::Iced(
+                    cosmic::iced::clipboard::write(value)
+                        .discard::<Message>()
+                        .into(),
+                ));
             }
         }
 
@@ -5798,7 +5805,7 @@ impl Tab {
         );
         // Desktop will not show DnD indicator
         if is_dnd_hovered && !matches!(self.mode, Mode::Desktop) {
-            container = container.style(|t| {
+            container = container.style(|t: &cosmic::Theme| {
                 let mut a = widget::container::Style::default();
                 let t = t.cosmic();
                 // todo use theme drop target color
@@ -5878,14 +5885,14 @@ impl Tab {
 
                     let content: cosmic::Element<'_, Message> =
                         if let Some(error_msg) = error_msg_opt {
-                            widget::column::with_capacity(2)
+                            widget::column::with_capacity::<Element<'_, Message>>(2)
                                 .push(widget::image(image_handle))
                                 .push(widget::text(format!("⚠ {}", error_msg)).size(13))
                                 .padding(space_xs)
                                 .align_x(cosmic::iced::Alignment::Center)
                                 .into()
                         } else if is_loading {
-                            widget::column::with_capacity(2)
+                            widget::column::with_capacity::<Element<'_, Message>>(2)
                                 .push(widget::image(image_handle))
                                 .push(widget::text("Loading higher resolution...").size(14))
                                 .padding(space_xs)
@@ -5920,10 +5927,11 @@ impl Tab {
             }
         }
 
-        let mut column = widget::column::with_capacity(2);
+        let mut column = widget::column::with_capacity::<Element<'_, Message>>(2);
         column = column.push(widget::space::vertical().height(Length::Fixed(space_m.into())));
         {
-            let mut row = widget::row::with_capacity(5).align_y(Alignment::Center);
+            let mut row =
+                widget::row::with_capacity::<Element<'_, Message>>(5).align_y(Alignment::Center);
             row = row.push(widget::space::horizontal());
             if let Some(name) = name_opt {
                 row = row.push(name);
@@ -5942,7 +5950,8 @@ impl Tab {
             column = column.push(mouse_area);
         }
         {
-            let mut row = widget::row::with_capacity(7).align_y(Alignment::Center);
+            let mut row =
+                widget::row::with_capacity::<Element<'_, Message>>(7).align_y(Alignment::Center);
             row = row.push(widget::space::horizontal().width(Length::Fixed(space_m.into())));
             row = row.push(
                 widget::button::icon(widget::icon::from_name("go-previous-symbolic"))
@@ -5972,7 +5981,7 @@ impl Tab {
         widget::container(column)
             .width(Length::Fill)
             .height(Length::Fill)
-            .style(|theme| {
+            .style(|theme: &cosmic::Theme| {
                 let cosmic = theme.cosmic();
                 let mut bg = cosmic.bg_color();
                 bg.alpha = 0.75;
@@ -5992,7 +6001,7 @@ impl Tab {
             font_size: f32,
             line_height: f32,
         ) -> f32 {
-            let text: text::Text<&'a str, font::Font> = text::Text {
+            let text: text::Text<&'a str> = text::Text {
                 content,
                 bounds: Size::INFINITE,
                 size: font_size.into(),
@@ -6002,7 +6011,8 @@ impl Tab {
                 align_y: Vertical::Top,
                 shaping: text::Shaping::default(),
                 wrapping: text::Wrapping::None,
-                ellipsize: text::Ellipsize::End(text::EllipsizeHeightLimit::Lines(1)),
+                ellipsis: text::Ellipsize::End(text::EllipsizeHeightLimit::Lines(1)).into(),
+                hint_factor: None,
             };
             graphics::text::Paragraph::with_text(text)
                 .min_bounds()
@@ -6061,8 +6071,8 @@ impl Tab {
         let condensed = size.width < (name_width + modified_width + size_width);
 
         let (sort_name, sort_direction, _) = self.sort_options();
-        let heading_item = |name, width, msg| {
-            let mut row = widget::row::with_capacity(2)
+        let heading_item = |name, width, msg| -> Element<'_, Message> {
+            let mut row = widget::row::with_capacity::<Element<'_, Message>>(2)
                 .align_y(Alignment::Center)
                 .spacing(space_xxxs)
                 .width(width);
@@ -6082,7 +6092,7 @@ impl Tab {
                 .into()
         };
 
-        let heading_row = widget::row::with_children([
+        let heading_row = widget::row::with_children::<Element<'_, Message>>([
             heading_item(fl!("name"), Length::Fill, HeadingOptions::Name),
             if self.location.is_trash() {
                 heading_item(
@@ -6104,14 +6114,17 @@ impl Tab {
         .padding([0, space_xxs]);
 
         let accent_rule =
-            rule::horizontal(1).class(theme::Rule::Custom(Box::new(|theme| rule::Style {
-                color: theme.cosmic().accent_color().into(),
-                radius: 0.0.into(),
-                fill_mode: rule::FillMode::Full,
-                snap: true,
+            rule::horizontal::<cosmic::Theme>(1).class(theme::Rule::Custom(Box::new(|theme| {
+                rule::Style {
+                    color: theme.cosmic().accent_color().into(),
+                    radius: 0.0.into(),
+                    fill_mode: rule::FillMode::Full,
+                    snap: true,
+                }
             })));
-        let heading_rule = widget::container(rule::horizontal(1))
-            .padding([0, theme::active().cosmic().corner_radii.radius_xs[0] as u16]);
+        let heading_rule =
+            widget::container::<_, cosmic::Theme>(rule::horizontal::<cosmic::Theme>(1))
+                .padding([0, theme::active().cosmic().corner_radii.radius_xs[0] as u16]);
 
         if let Some(edit_location) = &self.edit_location {
             let mut text_input = None;
@@ -6160,7 +6173,8 @@ impl Tab {
                     && !completions.is_empty()
                 {
                     let mut column =
-                        widget::column::with_capacity(completions.len()).padding(space_xxs);
+                        widget::column::with_capacity::<Element<'_, Message>>(completions.len())
+                            .padding(space_xxs);
                     for (i, (name, _path)) in completions.iter().enumerate() {
                         let selected = edit_location.selected == Some(i);
                         column = column.push(
@@ -6184,7 +6198,8 @@ impl Tab {
                     );
                 }
                 row = row.push(popover);
-                let mut column = widget::column::with_capacity(4).padding([0, space_s]);
+                let mut column =
+                    widget::column::with_capacity::<Element<'_, Message>>(4).padding([0, space_s]);
                 column = column.push(row);
                 column = column.push(accent_rule);
                 if self.config.view == View::List && !condensed {
@@ -6241,7 +6256,7 @@ impl Tab {
                     // Add padding for mouse area
                     w += 2.0 * f32::from(space_xxxs);
 
-                    let mut row = widget::row::with_capacity(2)
+                    let mut row = widget::row::with_capacity::<Element<'_, Message>>(2)
                         .align_y(Alignment::Center)
                         .spacing(space_xxxs);
                     //TODO: figure out why this hardcoded offset is needed after the first item is ellipsed
@@ -6329,7 +6344,8 @@ impl Tab {
         }
 
         row = row.extend(children);
-        let mut column = widget::column::with_capacity(4).padding([0, space_s]);
+        let mut column =
+            widget::column::with_capacity::<Element<'_, Message>>(4).padding([0, space_s]);
         column = column.push(row);
         column = column.push(accent_rule);
 
@@ -6344,29 +6360,33 @@ impl Tab {
     pub fn empty_view(&self, has_hidden: bool) -> Element<'_, Message> {
         let cosmic_theme::Spacing { space_xxs, .. } = theme::spacing();
 
-        mouse_area::MouseArea::new(widget::column::with_children([widget::container(
-            match self.mode {
-                Mode::App | Mode::Dialog(_) => widget::column::with_children([
-                    widget::icon::from_name("folder-symbolic")
-                        .size(64)
-                        .icon()
-                        .into(),
-                    widget::text::body(if has_hidden {
-                        fl!("empty-folder-hidden")
-                    } else if matches!(self.location, Location::Search(..)) {
-                        fl!("no-results")
-                    } else {
-                        fl!("empty-folder")
-                    })
-                    .into(),
-                ]),
-                Mode::Desktop => widget::column::with_capacity(0),
-            }
-            .align_x(Alignment::Center)
-            .spacing(space_xxs),
-        )
-        .center(Length::Fill)
-        .into()]))
+        mouse_area::MouseArea::new(widget::column::with_children::<Element<'_, Message>>([
+            widget::container(
+                match self.mode {
+                    Mode::App | Mode::Dialog(_) => {
+                        widget::column::with_children::<Element<'_, Message>>([
+                            widget::icon::from_name("folder-symbolic")
+                                .size(64)
+                                .icon()
+                                .into(),
+                            widget::text::body(if has_hidden {
+                                fl!("empty-folder-hidden")
+                            } else if matches!(self.location, Location::Search(..)) {
+                                fl!("no-results")
+                            } else {
+                                fl!("empty-folder")
+                            })
+                            .into(),
+                        ])
+                    }
+                    Mode::Desktop => widget::column::with_capacity::<Element<'_, Message>>(0),
+                }
+                .align_x(Alignment::Center)
+                .spacing(space_xxs),
+            )
+            .center(Length::Fill)
+            .into(),
+        ]))
         .on_press(|_| Message::Click(None))
         .into()
     }
@@ -6456,7 +6476,7 @@ impl Tab {
         let mut drag_e_i = 0;
         let mut drag_s_i = 0;
 
-        let mut column = widget::column::with_capacity(2);
+        let mut column = widget::column::with_capacity::<Element<'_, Message>>(2);
         if let Some(items) = self.column_sort() {
             let mut count = 0;
             let mut col = 0;
@@ -6508,7 +6528,7 @@ impl Tab {
                         false,
                     ));
 
-                    let mut column = widget::column::with_capacity(2)
+                    let mut column = widget::column::with_capacity::<Element<'_, Message>>(2)
                         .align_x(Alignment::Center)
                         .height(Length::Fixed(item_height as f32))
                         .width(Length::Fixed(item_width as f32));
@@ -6586,7 +6606,7 @@ impl Tab {
                     // Add a spacer if the row is empty, so scroll works
                     if grid_elements[row].is_empty() {
                         grid_elements[row].push(Element::from(
-                            widget::column::with_capacity(0)
+                            widget::column::with_capacity::<Element<'_, Message>>(0)
                                 .width(Length::Fill)
                                 .height(Length::Fixed(item_height as f32)),
                         ));
@@ -6775,7 +6795,7 @@ impl Tab {
         };
         let row_height = icon_size + 2 * space_xxs;
 
-        let mut column = widget::column::with_capacity(3);
+        let mut column = widget::column::with_capacity::<Element<'_, Message>>(3);
         let mut y: f32 = 0.0;
 
         let rule_padding = theme::active().cosmic().corner_radii.radius_xs[0] as u16;
@@ -6908,14 +6928,14 @@ impl Tab {
                     let is_renaming = self.inline_rename.as_ref().map_or(false, |r| r.index == i);
 
                     let row = if condensed {
-                        widget::row::with_children([
+                        widget::row::with_children::<Element<'_, Message>>([
                             widget::icon::icon(
                                 item.thumbnail_or_icon(&item.icon_handle_list_condensed),
                             )
                             .content_fit(ContentFit::Contain)
                             .size(icon_size)
                             .into(),
-                            widget::column::with_children([
+                            widget::column::with_children::<Element<'_, Message>>([
                                 if is_renaming {
                                     let rename = self.inline_rename.as_ref().unwrap();
                                     widget::text_input("", &rename.name)
@@ -6940,14 +6960,14 @@ impl Tab {
                         .align_y(Alignment::Center)
                         .spacing(space_xxs)
                     } else if is_search {
-                        widget::row::with_children([
+                        widget::row::with_children::<Element<'_, Message>>([
                             widget::icon::icon(
                                 item.thumbnail_or_icon(&item.icon_handle_list_condensed),
                             )
                             .content_fit(ContentFit::Contain)
                             .size(icon_size)
                             .into(),
-                            widget::column::with_children([
+                            widget::column::with_children::<Element<'_, Message>>([
                                 if is_renaming {
                                     let rename = self.inline_rename.as_ref().unwrap();
                                     widget::text_input("", &rename.name)
@@ -6980,7 +7000,7 @@ impl Tab {
                         .align_y(Alignment::Center)
                         .spacing(space_xxs)
                     } else {
-                        widget::row::with_children([
+                        widget::row::with_children::<Element<'_, Message>>([
                             widget::icon::icon(item.thumbnail_or_icon(&item.icon_handle_list))
                                 .content_fit(ContentFit::Contain)
                                 .size(icon_size)
@@ -7081,14 +7101,14 @@ impl Tab {
                                 space::vertical().height(Length::Fixed(f32::from(row_height))),
                             )
                         } else if condensed {
-                            widget::row::with_children([
+                            widget::row::with_children::<Element<'_, Message>>([
                                 widget::icon::icon(
                                     item.thumbnail_or_icon(&item.icon_handle_list_condensed),
                                 )
                                 .content_fit(ContentFit::Contain)
                                 .size(icon_size)
                                 .into(),
-                                widget::column::with_children([
+                                widget::column::with_children::<Element<'_, Message>>([
                                     Item::list_display_name(item.display_name.clone()).into(),
                                     //TODO: translate?
                                     widget::text::body(format!("{modified_text} - {size_text}"))
@@ -7100,14 +7120,14 @@ impl Tab {
                             .spacing(space_xxs)
                             .into()
                         } else if is_search {
-                            widget::row::with_children([
+                            widget::row::with_children::<Element<'_, Message>>([
                                 widget::icon::icon(
                                     item.thumbnail_or_icon(&item.icon_handle_list_condensed),
                                 )
                                 .content_fit(ContentFit::Contain)
                                 .size(icon_size)
                                 .into(),
-                                widget::column::with_children([
+                                widget::column::with_children::<Element<'_, Message>>([
                                     Item::list_display_name(item.display_name.clone()).into(),
                                     widget::text::caption(match item.path_opt() {
                                         Some(path) => path.display().to_string(),
@@ -7128,7 +7148,7 @@ impl Tab {
                             .spacing(space_xxs)
                             .into()
                         } else {
-                            widget::row::with_children([
+                            widget::row::with_children::<Element<'_, Message>>([
                                 widget::icon::icon(item.thumbnail_or_icon(&item.icon_handle_list))
                                     .content_fit(ContentFit::Contain)
                                     .size(icon_size)
@@ -7188,7 +7208,7 @@ impl Tab {
 
                     button_row
                 } else {
-                    widget::column::with_capacity(0)
+                    widget::column::with_capacity::<Element<'_, Message>>(0)
                         .width(Length::Fill)
                         .height(Length::Fixed(f32::from(row_height)))
                         .into()
@@ -7285,7 +7305,7 @@ impl Tab {
             ..
         } = theme::spacing();
 
-        let mut status = widget::row::with_capacity(8)
+        let mut status = widget::row::with_capacity::<Element<'_, Message>>(8)
             .align_y(Alignment::Center)
             .spacing(space_xxs);
 
@@ -7295,7 +7315,7 @@ impl Tab {
         if size.width >= min_status_bar_text_width() {
             let counts = self.status_bar_counts();
 
-            let mut text_row = widget::row::with_capacity(4)
+            let mut text_row = widget::row::with_capacity::<Element<'_, Message>>(4)
                 .align_y(Alignment::Center)
                 .spacing(space_xxs)
                 .push(
@@ -7530,7 +7550,7 @@ impl Tab {
             context_menu = context_menu.window_id(window_id);
         }
 
-        let mut tab_column = widget::column::with_capacity(3);
+        let mut tab_column = widget::column::with_capacity::<Element<'_, Message>>(3);
         if let Some(location_view) = location_view_opt {
             tab_column = tab_column.push(location_view);
         }
@@ -7541,12 +7561,14 @@ impl Tab {
                     && !items.is_empty()
                 {
                     tab_column = tab_column.push(
-                        widget::layer_container(widget::row::with_children([
-                            widget::space::horizontal().into(),
-                            widget::button::standard(fl!("empty-trash"))
-                                .on_press(Message::EmptyTrash)
-                                .into(),
-                        ]))
+                        widget::layer_container(
+                            widget::row::with_children::<Element<'_, Message>>([
+                                widget::space::horizontal().into(),
+                                widget::button::standard(fl!("empty-trash"))
+                                    .on_press(Message::EmptyTrash)
+                                    .into(),
+                            ]),
+                        )
                         .padding([space_xxs, space_xs])
                         .layer(cosmic_theme::Layer::Primary)
                         .apply(widget::container)
@@ -7559,12 +7581,14 @@ impl Tab {
                     && !items.is_empty()
                 {
                     tab_column = tab_column.push(
-                        widget::layer_container(widget::row::with_children([
-                            widget::space::horizontal().into(),
-                            widget::button::standard(fl!("clear-recents-history"))
-                                .on_press(Message::ClearRecents)
-                                .into(),
-                        ]))
+                        widget::layer_container(
+                            widget::row::with_children::<Element<'_, Message>>([
+                                widget::space::horizontal().into(),
+                                widget::button::standard(fl!("clear-recents-history"))
+                                    .on_press(Message::ClearRecents)
+                                    .into(),
+                            ]),
+                        )
                         .padding([space_xxs, space_xs])
                         .layer(cosmic_theme::Layer::Primary)
                         .apply(widget::container)
@@ -7574,7 +7598,7 @@ impl Tab {
             }
             Location::Network(uri, _display_name, _path) if uri == "network:///" => {
                 tab_column = tab_column.push(
-                    widget::layer_container(widget::row::with_children([
+                    widget::layer_container(widget::row::with_children::<Element<'_, Message>>([
                         widget::space::horizontal().into(),
                         widget::button::standard(fl!("add-network-drive"))
                             .on_press(Message::AddNetworkDrive)
@@ -7599,7 +7623,7 @@ impl Tab {
         if self.dnd_hovered.as_ref().map(|(l, _)| l) == Some(&tab_location)
             && !matches!(self.mode, Mode::Desktop)
         {
-            tab_view = tab_view.style(|t| {
+            tab_view = tab_view.style(|t: &cosmic::Theme| {
                 let mut a = widget::container::Style::default();
                 let c = t.cosmic();
                 a.border = cosmic::iced::core::Border {
@@ -7643,7 +7667,7 @@ impl Tab {
             ..
         } = theme::spacing();
 
-        let mut column = widget::column::with_capacity(4).spacing(space_m);
+        let mut column = widget::column::with_capacity::<Element<'_, Message>>(4).spacing(space_m);
 
         let handle = widget::icon::from_name("text-x-generic")
             .size(IconSizes::default().grid())
@@ -7653,10 +7677,12 @@ impl Tab {
             .content_fit(ContentFit::Contain)
             .size(IconSizes::default().grid());
 
-        let icon_container1 = widget::container(icon.clone()).padding(padding::bottom(10).left(10));
-        let icon_container2 =
-            widget::container(icon.clone()).padding(padding::top(5).bottom(5).left(5).right(5));
-        let icon_container3 = widget::container(icon).padding(padding::top(10).right(10));
+        let icon_container1 =
+            widget::container(Element::from(icon.clone())).padding(padding::bottom(10).left(10));
+        let icon_container2 = widget::container(Element::from(icon.clone()))
+            .padding(padding::top(5).bottom(5).left(5).right(5));
+        let icon_container3 =
+            widget::container(Element::from(icon)).padding(padding::top(10).right(10));
         let stack = stack![icon_container1, icon_container2, icon_container3];
 
         column = column.push(
@@ -7681,7 +7707,8 @@ impl Tab {
                 .collect()
         });
 
-        let mut details = widget::column::with_capacity(3).spacing(space_xxxs);
+        let mut details =
+            widget::column::with_capacity::<Element<'_, Message>>(3).spacing(space_xxxs);
         details = details.push(widget::text::body(fl!(
             "items",
             items = selected_items.len()
@@ -7902,7 +7929,7 @@ impl Tab {
         context_actions: &'a [ContextActionPreset],
         pane: PaneSettings,
     ) -> Element<'a, Message> {
-        widget::responsive(move |size| {
+        Element::new(widget::responsive(move |size| {
             widget::id_container(
                 self.view_responsive(
                     key_binds,
@@ -7917,9 +7944,7 @@ impl Tab {
                     self.scrollable_id, self.location_title
                 )),
             )
-            .into()
-        })
-        .into()
+        }))
     }
 
     pub fn subscription(&self, preview: bool) -> Subscription<Message> {

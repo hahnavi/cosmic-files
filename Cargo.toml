@@ -192,7 +192,9 @@ cosmic-theme = { git = "https://github.com/hahnavi/libcosmic", branch = "hahnavi
 # cosmic-config = { path = "../libcosmic/cosmic-config" }
 # cosmic-theme = { path = "../libcosmic/cosmic-theme" }
 
-# [patch.'https://github.com/pop-os/cosmic-protocols']
+[patch.'https://github.com/pop-os/cosmic-protocols']
+cosmic-protocols = { git = "https://github.com/hahnavi/cosmic-protocols", branch = "hahnavi" }
+cctk = { git = "https://github.com/hahnavi/cosmic-protocols", package = "cosmic-client-toolkit", branch = "hahnavi", optional = true }
 # cosmic-protocols = { path = "../cosmic-protocols" }
 # cctk = { path = "../cosmic-protocols/client-toolkit", package = "cosmic-client-toolkit" }
 

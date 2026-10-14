@@ -1,6 +1,7 @@
 // Copyright 2023 System76 <info@system76.com>
 // SPDX-License-Identifier: GPL-3.0-only
 
+use crate::scrollable;
 use cosmic::app::{self, Core, Task, context_drawer};
 use cosmic::core::Auto;
 use cosmic::cosmic_config::{self, ConfigSet};
@@ -14,7 +15,6 @@ use cosmic::iced::keyboard::{Event as KeyEvent, Key, Modifiers, key::Named};
 use cosmic::iced::platform_specific::shell::wayland::commands::overlap_notify::overlap_notify;
 use cosmic::iced::runtime::{clipboard, task};
 use cosmic::iced::widget::button::focus;
-use cosmic::iced::widget::scrollable;
 use cosmic::iced::widget::scrollable::AbsoluteOffset;
 use cosmic::iced::window::{self, Event as WindowEvent, Id as WindowId};
 use cosmic::iced::{self, Alignment, Event, Length, Size, Subscription, event, mouse, stream};
@@ -1929,9 +1929,9 @@ impl App {
         let cosmic_theme::Spacing {
             space_xxs, space_m, ..
         } = theme::spacing();
-        let mut table = widget::column::with_capacity(8);
+        let mut table = widget::column::with_capacity::<Element<'_, Message>>(8);
         for (i, line) in fl!("network-drive-schemes").lines().enumerate() {
-            let mut row = widget::row::with_capacity(2);
+            let mut row = widget::row::with_capacity::<Element<'_, Message>>(2);
             for part in line.split(',') {
                 row = row.push(
                     widget::container(if i == 0 {
@@ -1948,7 +1948,7 @@ impl App {
                 table = table.push(widget::divider::horizontal::light());
             }
         }
-        widget::column::with_children([
+        widget::column::with_children::<Element<'_, Message>>([
             widget::text::body(fl!("network-drive-description")).into(),
             table.into(),
         ])
@@ -2025,7 +2025,7 @@ impl App {
                     ),
             );
 
-        widget::column::with_capacity(2)
+        widget::column::with_capacity::<Element<'_, Message>>(2)
             .padding([0, space_l, space_l, space_l])
             .spacing(space_m)
             .push(show_on_desktop)
@@ -2036,7 +2036,7 @@ impl App {
     fn edit_history(&self) -> Element<'_, Message> {
         let cosmic_theme::Spacing { space_m, .. } = theme::spacing();
 
-        let mut children = Vec::new();
+        let mut children: Vec<Element<'_, Message>> = Vec::new();
 
         //TODO: get height from theme?
         let progress_bar_height = Length::Fixed(4.0);
@@ -2045,8 +2045,8 @@ impl App {
             let mut section = widget::settings::section().title(fl!("pending"));
             for (id, (op, controller)) in self.pending_operations.iter().rev() {
                 let progress = controller.progress();
-                section = section.add(widget::column::with_children([
-                    widget::row::with_children([
+                section = section.add(widget::column::with_children::<Element<'_, Message>>([
+                    widget::row::with_children::<Element<'_, Message>>([
                         widget::determinate_linear(progress)
                             .width(Length::Fill)
                             .girth(progress_bar_height)
@@ -2095,7 +2095,7 @@ impl App {
             let mut section = widget::settings::section().title(fl!("failed"));
             for (op, controller, error) in self.failed_operations.values().rev() {
                 let progress = controller.progress();
-                section = section.add(widget::column::with_children([
+                section = section.add(widget::column::with_children::<Element<'_, Message>>([
                     widget::text::body(op.pending_text(progress, controller.state())).into(),
                     widget::text::body(error).into(),
                 ]));
@@ -2537,13 +2537,19 @@ impl Application for App {
 
         let mut nav = nav.into_container();
 
-        if !self.core.is_condensed() {
+        let condensed = self.core.is_condensed();
+        let nav_width = if condensed {
+            Length::Shrink
+        } else {
+            Length::Fill
+        };
+        nav = nav.width(nav_width).height(Length::Fill);
+
+        if !condensed {
             nav = nav.max_width(280);
         }
 
-        Some(Element::from(
-            nav.width(Length::Shrink).height(Length::Fill),
-        ))
+        Some(Element::from(nav))
     }
 
     fn nav_context_menu(&self) -> Option<Vec<widget::menu::Tree<cosmic::Action<Self::Message>>>> {
@@ -2967,7 +2973,7 @@ impl Application for App {
                 let path_strings: Vec<String> =
                     paths.into_iter().map(|p| p.display().to_string()).collect();
                 let text = path_strings.join("\n");
-                return clipboard::write(text);
+                return clipboard::write(text).map(|_| cosmic::Action::None);
             }
             Message::CopyTo(entity_opt) => {
                 let selected_paths: Box<[_]> = self.selected_paths(entity_opt).collect();
@@ -5478,7 +5484,7 @@ impl Application for App {
                 )
                 .title(fl!("add-network-drive"))
                 .header(text_input)
-                .footer(widget::row::with_children([
+                .footer(widget::row::with_children::<Element<'_, Message>>([
                     widget::space::horizontal().into(),
                     button.into(),
                 ]))
@@ -5582,7 +5588,7 @@ impl Application for App {
                         widget::button::standard(fl!("cancel")).on_press(Message::DialogCancel),
                     )
                     .control(
-                        widget::column::with_children([
+                        widget::column::with_children::<Element<'_, Message>>([
                             widget::text::body(fl!("file-name")).into(),
                             widget::row::with_children([
                                 widget::text_input("", name.as_str())
@@ -5624,22 +5630,23 @@ impl Application for App {
 
                 if *archive_type == ArchiveType::Zip {
                     let password_unwrapped = password.clone().unwrap_or_default();
-                    dialog = dialog.control(widget::column::with_children([
-                        widget::text::body(fl!("password")).into(),
-                        widget::text_input("", password_unwrapped)
-                            .password()
-                            .on_input(move |password_unwrapped| {
-                                Message::DialogUpdate(DialogPage::Compress {
-                                    paths: paths.clone(),
-                                    to: to.clone(),
-                                    name: name.clone(),
-                                    archive_type: *archive_type,
-                                    password: Some(password_unwrapped),
+                    dialog =
+                        dialog.control(widget::column::with_children::<Element<'_, Message>>([
+                            widget::text::body(fl!("password")).into(),
+                            widget::text_input("", password_unwrapped)
+                                .password()
+                                .on_input(move |password_unwrapped| {
+                                    Message::DialogUpdate(DialogPage::Compress {
+                                        paths: paths.clone(),
+                                        to: to.clone(),
+                                        name: name.clone(),
+                                        archive_type: *archive_type,
+                                        password: Some(password_unwrapped),
+                                    })
                                 })
-                            })
-                            .on_submit_maybe(complete_maybe.map(|maybe| move |_| maybe.clone()))
-                            .into(),
-                    ]));
+                                .on_submit_maybe(complete_maybe.map(|maybe| move |_| maybe.clone()))
+                                .into(),
+                        ]));
                 }
 
                 dialog
@@ -5730,7 +5737,7 @@ impl Application for App {
                 auth_tx,
             } => {
                 //TODO: use URI!
-                let mut controls = widget::column::with_capacity(4);
+                let mut controls = widget::column::with_capacity::<Element<'_, Message>>(4);
                 let mut id_assigned = false;
 
                 if let Some(username) = &auth.username_opt {
@@ -5912,7 +5919,7 @@ impl Application for App {
                         widget::button::standard(fl!("cancel")).on_press(Message::DialogCancel),
                     )
                     .control(
-                        widget::column::with_children([
+                        widget::column::with_children::<Element<'_, Message>>([
                             widget::text::body(if *dir {
                                 fl!("folder-name")
                             } else {
@@ -5994,8 +6001,8 @@ impl Application for App {
                     column = column.add(
                         widget::mouse_area(
                             widget::button::custom(
-                                widget::row::with_children([
-                                    icon(app.icon()).size(32).into(),
+                                widget::row::with_children::<Element<'_, Message>>([
+                                    Element::from(icon(app.icon()).size(32)),
                                     if app.is_default(mime) && !displayed_default {
                                         displayed_default = true;
                                         widget::text::body(fl!(
@@ -6008,7 +6015,9 @@ impl Application for App {
                                     },
                                     widget::space::horizontal().into(),
                                     if *selected == i {
-                                        icon::from_name("checkbox-checked-symbolic").size(16).into()
+                                        Element::from(
+                                            icon::from_name("checkbox-checked-symbolic").size(16),
+                                        )
                                     } else {
                                         widget::space::horizontal()
                                             .width(Length::Fixed(16.0))
@@ -6148,7 +6157,7 @@ impl Application for App {
                         widget::button::standard(fl!("cancel")).on_press(Message::DialogCancel),
                     )
                     .control(
-                        widget::column::with_children([
+                        widget::column::with_children::<Element<'_, Message>>([
                             widget::text::body(fl!("sidebar-label")).into(),
                             widget::text_input("", label.as_str())
                                 .id(self.dialog_text_input.clone())
@@ -6216,7 +6225,7 @@ impl Application for App {
                         widget::button::standard(fl!("cancel")).on_press(Message::DialogCancel),
                     )
                     .control(
-                        widget::column::with_children([
+                        widget::column::with_children::<Element<'_, Message>>([
                             widget::text::body(if *dir {
                                 fl!("folder-name")
                             } else {
@@ -6405,57 +6414,58 @@ impl Application for App {
             .width(Length::Fill)
             .girth(progress_bar_height);
 
-        let container = widget::layer_container(widget::column::with_children([
-            widget::row::with_children([
-                progress_bar.into(),
-                if all_paused {
+        let container =
+            widget::layer_container(widget::column::with_children::<Element<'_, Message>>([
+                widget::row::with_children::<Element<'_, Message>>([
+                    progress_bar.into(),
+                    if all_paused {
+                        widget::tooltip(
+                            widget::button::icon(icon::from_name("media-playback-start-symbolic"))
+                                .on_press(Message::PendingPauseAll(false))
+                                .padding(8),
+                            widget::text::body(fl!("resume")),
+                            widget::tooltip::Position::Top,
+                        )
+                        .into()
+                    } else {
+                        widget::tooltip(
+                            widget::button::icon(icon::from_name("media-playback-pause-symbolic"))
+                                .on_press(Message::PendingPauseAll(true))
+                                .padding(8),
+                            widget::text::body(fl!("pause")),
+                            widget::tooltip::Position::Top,
+                        )
+                        .into()
+                    },
                     widget::tooltip(
-                        widget::button::icon(icon::from_name("media-playback-start-symbolic"))
-                            .on_press(Message::PendingPauseAll(false))
+                        widget::button::icon(icon::from_name("window-close-symbolic"))
+                            .on_press(Message::PendingCancelAll)
                             .padding(8),
-                        widget::text::body(fl!("resume")),
+                        widget::text::body(fl!("cancel")),
                         widget::tooltip::Position::Top,
                     )
-                    .into()
-                } else {
-                    widget::tooltip(
-                        widget::button::icon(icon::from_name("media-playback-pause-symbolic"))
-                            .on_press(Message::PendingPauseAll(true))
-                            .padding(8),
-                        widget::text::body(fl!("pause")),
-                        widget::tooltip::Position::Top,
-                    )
-                    .into()
-                },
-                widget::tooltip(
-                    widget::button::icon(icon::from_name("window-close-symbolic"))
-                        .on_press(Message::PendingCancelAll)
-                        .padding(8),
-                    widget::text::body(fl!("cancel")),
-                    widget::tooltip::Position::Top,
-                )
+                    .into(),
+                ])
+                .align_y(Alignment::Center)
                 .into(),
-            ])
-            .align_y(Alignment::Center)
-            .into(),
-            widget::text::body(title).into(),
-            widget::space::vertical().height(space_s).into(),
-            widget::row::with_children([
-                widget::button::link(fl!("details"))
-                    .on_press(Message::ToggleContextPage(ContextPage::EditHistory))
-                    .padding(0)
-                    .trailing_icon(true)
-                    .into(),
-                widget::space::horizontal().into(),
-                widget::button::standard(fl!("dismiss"))
-                    .on_press(Message::PendingDismiss)
-                    .into(),
-            ])
-            .align_y(Alignment::Center)
-            .into(),
-        ]))
-        .padding([8, space_xs])
-        .layer(cosmic_theme::Layer::Primary);
+                widget::text::body(title).into(),
+                widget::space::vertical().height(space_s).into(),
+                widget::row::with_children::<Element<'_, Message>>([
+                    widget::button::link(fl!("details"))
+                        .on_press(Message::ToggleContextPage(ContextPage::EditHistory))
+                        .padding(0)
+                        .trailing_icon(true)
+                        .into(),
+                    widget::space::horizontal().into(),
+                    widget::button::standard(fl!("dismiss"))
+                        .on_press(Message::PendingDismiss)
+                        .into(),
+                ])
+                .align_y(Alignment::Center)
+                .into(),
+            ]))
+            .padding([8, space_xs])
+            .layer(cosmic_theme::Layer::Primary);
 
         Some(container.into())
     }
@@ -6512,7 +6522,7 @@ impl Application for App {
             space_xxs, space_s, ..
         } = theme::spacing();
 
-        let mut tab_column = widget::column::with_capacity(4);
+        let mut tab_column = widget::column::with_capacity::<Element<'_, Self::Message>>(4);
 
         if self.core.is_condensed()
             && let Some(term) = self.search_get()
@@ -6607,7 +6617,8 @@ impl Application for App {
         let content = match self.windows.get(&id) {
             Some(window) => match &window.kind {
                 WindowKind::Desktop(entity) => {
-                    let mut tab_column = widget::column::with_capacity(3);
+                    let mut tab_column =
+                        widget::column::with_capacity::<Element<'_, Self::Message>>(3);
 
                     let tab_view = match self.tab_model.data::<Tab>(*entity) {
                         Some(tab) => tab
@@ -6636,11 +6647,13 @@ impl Application for App {
                             ]);
                         }
                         if margin.1 >= 0. || margin.3 >= 0. {
-                            Element::from(widget::row::with_children([
-                                space::horizontal().width(margin.1).into(),
-                                tab_column.into(),
-                                space::horizontal().width(margin.3).into(),
-                            ]))
+                            Element::from(widget::row::with_children::<Element<'_, Self::Message>>(
+                                [
+                                    space::horizontal().width(margin.1).into(),
+                                    tab_column.into(),
+                                    space::horizontal().width(margin.3).into(),
+                                ],
+                            ))
                         } else {
                             tab_column.into()
                         }
@@ -6734,9 +6747,9 @@ impl Application for App {
                 #[cfg(not(all(feature = "wayland", feature = "desktop-applet")))]
                 Event::Window(WindowEvent::Focused) => Some(Message::CheckClipboard),
                 Event::Window(WindowEvent::CloseRequested) => Some(Message::WindowClose),
-                Event::Window(WindowEvent::Opened { position: _, size }) => {
-                    Some(Message::Size(window_id, size))
-                }
+                Event::Window(WindowEvent::Opened {
+                    position: _, size, ..
+                }) => Some(Message::Size(window_id, size)),
                 Event::Window(WindowEvent::Resized(s)) => Some(Message::Size(window_id, s)),
                 #[cfg(all(feature = "wayland", feature = "desktop-applet"))]
                 Event::PlatformSpecific(event::PlatformSpecific::Wayland(wayland_event)) => {

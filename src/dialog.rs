@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use crate::recently_used::update_recently_used;
+use crate::scrollable;
 use cosmic::app::cosmic::Cosmic;
 use cosmic::app::{Core, Task, context_drawer};
 use cosmic::iced::core::SmolStr;
@@ -10,7 +11,6 @@ use cosmic::iced::futures::{self, SinkExt};
 use cosmic::iced::keyboard::key::{Named, Physical};
 use cosmic::iced::keyboard::{Event as KeyEvent, Key, Modifiers};
 use cosmic::iced::platform_specific::shell::{self as iced_winit, SurfaceIdWrapper};
-use cosmic::iced::widget::scrollable;
 use cosmic::iced::widget::scrollable::AbsoluteOffset;
 use cosmic::iced::{
     self, Alignment, Event, Length, Size, Subscription, event, mouse, stream, window,
@@ -194,7 +194,9 @@ impl<'a, M: Clone + 'static> From<&'a DialogLabel> for Element<'a, M> {
         for span in &label.spans {
             iced_spans.push(cosmic::iced::widget::span(&span.text).underline(span.underline));
         }
-        cosmic::iced::widget::rich_text(iced_spans).into()
+        Element::new(cosmic::iced::widget::rich_text::<(), M, cosmic::Theme>(
+            iced_spans,
+        ))
     }
 }
 
@@ -595,7 +597,7 @@ impl App {
         } = theme::spacing();
         let is_condensed = self.core().is_condensed();
 
-        let mut col = widget::column::with_capacity(2).spacing(space_xxs);
+        let mut col = widget::column::with_capacity::<Element<'_, Message>>(2).spacing(space_xxs);
         if let DialogKind::SaveFile { filename } = &self.flags.kind {
             col = col.push(
                 widget::text_input("", filename)
@@ -606,7 +608,7 @@ impl App {
             );
         }
 
-        let mut row = widget::row::with_capacity(
+        let mut row = widget::row::with_capacity::<Element<'_, Message>>(
             usize::from(!self.filters.is_empty())
                 + self.choices.len() * 2
                 + if is_condensed { 0 } else { 3 },
@@ -1185,7 +1187,7 @@ impl Application for App {
                         widget::button::standard(fl!("cancel")).on_press(Message::DialogCancel),
                     )
                     .control(
-                        widget::column::with_children([
+                        widget::column::with_children::<Element<'_, Message>>([
                             widget::text::body(fl!("folder-name")).into(),
                             widget::text_input("", name.as_str())
                                 .id(self.dialog_text_input.clone())
@@ -1291,13 +1293,19 @@ impl Application for App {
         )
         .into_container();
 
-        if !self.core().is_condensed() {
+        let condensed = self.core().is_condensed();
+        let nav_width = if condensed {
+            Length::Shrink
+        } else {
+            Length::Fill
+        };
+        nav = nav.width(nav_width).height(Length::Fill);
+
+        if !condensed {
             nav = nav.max_width(280);
         }
 
-        Some(Element::from(
-            nav.width(Length::Shrink).height(Length::Fill),
-        ))
+        Some(Element::from(nav))
     }
 
     fn nav_model(&self) -> Option<&segmented_button::SingleSelectModel> {
@@ -1942,7 +1950,7 @@ impl Application for App {
     fn view(&self) -> Element<'_, Message> {
         let cosmic_theme::Spacing { space_xxs, .. } = theme::spacing();
 
-        let mut col = widget::column::with_capacity(2);
+        let mut col = widget::column::with_capacity::<Element<'_, Message>>(2);
 
         if self.core.is_condensed()
             && let Some(term) = self.search_get()

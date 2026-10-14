@@ -2,7 +2,7 @@ use cosmic::iced::{core as iced_core, widget as iced_widget};
 use iced_core::event::Event;
 use iced_core::widget::{Operation, Tree};
 use iced_core::{
-    Clipboard, Element, Layout, Length, Rectangle, Shell, Vector, Widget, layout, mouse, overlay,
+    Element, Layout, Length, Rectangle, Shell, Size, Vector, Widget, layout, mouse, overlay,
     renderer,
 };
 
@@ -61,36 +61,28 @@ where
         self.content.as_widget().size()
     }
 
-    fn layout(
-        &mut self,
-        tree: &mut Tree,
-        renderer: &Renderer,
-        limits: &layout::Limits,
-    ) -> layout::Node {
-        let node = self
-            .content
+    fn layout(&mut self, tree: &mut Tree, renderer: &Renderer, limits: &layout::Limits) {
+        self.content
             .as_widget_mut()
             .layout(&mut tree.children[0], renderer, limits);
-        let size = node.size();
-        layout::Node::with_children(size, vec![node])
+        tree.size = tree.children[0].size;
     }
 
     fn operate(
         &mut self,
         tree: &mut Tree,
-        layout: Layout<'_>,
+        layout: Layout,
+        viewport: &Rectangle,
         renderer: &Renderer,
         operation: &mut dyn Operation,
     ) {
-        operation.container(None, layout.bounds());
+        operation.container(None, layout.bounds(), viewport);
         operation.traverse(&mut |operation| {
+            let child_layout = layout.child(&tree.children[0]);
             self.content.as_widget_mut().operate(
                 &mut tree.children[0],
-                layout
-                    .children()
-                    .next()
-                    .unwrap()
-                    .with_virtual_offset(layout.virtual_offset()),
+                child_layout,
+                viewport,
                 renderer,
                 operation,
             );
@@ -101,10 +93,9 @@ where
         &mut self,
         tree: &mut Tree,
         event: &Event,
-        layout: Layout<'_>,
+        layout: Layout,
         cursor_position: mouse::Cursor,
         renderer: &Renderer,
-        clipboard: &mut dyn Clipboard,
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
@@ -118,7 +109,6 @@ where
                 .with_virtual_offset(layout.virtual_offset()),
             cursor_position,
             renderer,
-            clipboard,
             shell,
             viewport,
         );
@@ -127,12 +117,12 @@ where
     fn mouse_interaction(
         &self,
         tree: &Tree,
-        layout: Layout<'_>,
+        layout: Layout,
         cursor_position: mouse::Cursor,
         viewport: &Rectangle,
         renderer: &Renderer,
     ) -> mouse::Interaction {
-        let content_layout = layout.children().next().unwrap();
+        let content_layout = layout.child(&tree.children[0]);
         self.content.as_widget().mouse_interaction(
             &tree.children[0],
             content_layout.with_virtual_offset(layout.virtual_offset()),
@@ -148,11 +138,11 @@ where
         renderer: &mut Renderer,
         theme: &Theme,
         renderer_style: &renderer::Style,
-        layout: Layout<'_>,
+        layout: Layout,
         cursor_position: mouse::Cursor,
         viewport: &Rectangle,
     ) {
-        let content_layout = layout.children().next().unwrap();
+        let content_layout = layout.child(&tree.children[0]);
 
         // forces image to be loaded before drawing
         _ = renderer.load_image(&self.handle);
@@ -170,32 +160,31 @@ where
     fn overlay<'b>(
         &'b mut self,
         tree: &'b mut Tree,
-        layout: Layout<'b>,
+        layout: Layout,
         renderer: &Renderer,
         viewport: &Rectangle,
         translation: Vector,
-    ) -> Option<overlay::Element<'b, Message, Theme, Renderer>> {
+        window: Size,
+    ) -> Vec<overlay::Element<'b, Message, Theme, Renderer>> {
+        let child_layout = layout.child(&tree.children[0]);
         self.content.as_widget_mut().overlay(
             &mut tree.children[0],
-            layout
-                .children()
-                .next()
-                .unwrap()
-                .with_virtual_offset(layout.virtual_offset()),
+            child_layout,
             renderer,
             viewport,
             translation,
+            window,
         )
     }
 
     fn drag_destinations(
         &self,
         state: &Tree,
-        layout: Layout<'_>,
+        layout: Layout,
         renderer: &Renderer,
         dnd_rectangles: &mut iced_core::clipboard::DndDestinationRectangles,
     ) {
-        let content_layout = layout.children().next().unwrap();
+        let content_layout = layout.child(&state.children[0]);
         self.content.as_widget().drag_destinations(
             &state.children[0],
             content_layout.with_virtual_offset(layout.virtual_offset()),
